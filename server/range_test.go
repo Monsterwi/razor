@@ -33,7 +33,7 @@ func TestRangeOverlapsReuseCommittedBlocks(t *testing.T) {
 		header     string
 		start, end int
 		query      string
-	}{{"bytes=0-1572863", 0, 1572864, "b=2&a=1"}, {"bytes=1048576-2097151", 1048576, 2097152, "a=1&b=2"}} {
+	}{{"bytes=0-1572863", 0, 1572864, "b=2&a=1"}, {"bytes=1048576-2097151", 1048576, 2097152, "b=2&a=1"}} {
 		got := fetch(s, "http://cache.test/item?"+spec.query, http.Header{"Range": {spec.header}})
 		if got.Code != 206 || !bytes.Equal(got.Body.Bytes(), data[spec.start:spec.end]) {
 			t.Fatalf("range %s status=%d length=%d", spec.header, got.Code, got.Body.Len())
@@ -75,7 +75,20 @@ func TestRangeVersionChangeRejectsMixedBodyAndRecovers(t *testing.T) {
 		w.Header().Set("Cache-Control", "public,max-age=3600")
 		http.ServeContent(w, r, "body", time.Time{}, bytes.NewReader(data))
 	})
-	assertIncompleteRange(t, s, "bytes=0-3145727", 3<<20)
+	front := httptest.NewServer(s)
+	defer front.Close()
+	req, _ := http.NewRequest(http.MethodGet, front.URL+"/item", nil)
+	req.Host = "cache.test"
+	req.Header.Set("Range", "bytes=0-3145727")
+	resp, err := front.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 206 || resp.Header.Get("ETag") != `"one"` || err == nil || len(body) != 2<<20 || !bytes.Equal(body, old[:2<<20]) {
+		t.Fatalf("version conflict must abort after only old bytes: status=%d bytes=%d error=%v", resp.StatusCode, len(body), err)
+	}
 	if gets.Load() != 2 {
 		t.Fatalf("version change retried current request: GET=%d", gets.Load())
 	}
@@ -294,7 +307,7 @@ func TestRangePurgeFencesAllBlocksAndKeepsAdjacentURL(t *testing.T) {
 		first <- err
 	}()
 	<-entered
-	if got = purge(s, "http://cache.test/item?a=1&b=2", "test-secret"); got.Code != 200 {
+	if got = purge(s, "http://cache.test/item?b=2&a=1", "test-secret"); got.Code != 200 {
 		t.Fatal(got.Code)
 	}
 	once.Do(func() { close(release) })

@@ -183,8 +183,16 @@ func (c *Cache) openWriteFillKeyReplacingLocked(ctx context.Context, token *Fill
 // InvalidateFill fences unfinished fills and removes only snapshot-owned heads.
 // A writer reservation must not prevent fencing, but newer committed heads survive.
 func (c *Cache) InvalidateFill(token *FillToken) error {
+	return c.invalidateFill(token, false)
+}
+
+func (c *Cache) invalidateFill(token *FillToken, unchanged bool) error {
 	unlock := c.lockStripes()
-	if err := c.checkFillEpochsLocked(token); err != nil {
+	check := c.checkFillEpochsLocked
+	if unchanged {
+		check = c.checkFillLocked
+	}
+	if err := check(token); err != nil {
 		unlock()
 		return err
 	}

@@ -47,7 +47,7 @@ func TestPublicStaticHundredClientsShareCanonicalOriginRequest(t *testing.T) {
 	results := make(chan *httptest.ResponseRecorder, clients)
 	for i := 0; i < clients; i++ {
 		go func(i int) {
-			query := []string{"b=2&a=1", "a=1&b=2"}[i%2]
+			query := "b=2&a=1"
 			r := httptest.NewRequest("GET", "http://cache.test/item?"+query, nil)
 			r.RemoteAddr = fmt.Sprintf("192.0.2.%d:12345", i+1)
 			r.Header.Set("User-Agent", fmt.Sprintf("client-%d", i))
@@ -221,7 +221,7 @@ func TestPublicStaticAuthenticatedRequestsRetainProxyIdentity(t *testing.T) {
 	}
 }
 
-func TestPublicStaticSchemeCanonicalQueryPurgeAndRestartBoundary(t *testing.T) {
+func TestPublicStaticSchemeRawQueryPurgeAndRestartBoundary(t *testing.T) {
 	var calls atomic.Int32
 	s, cfg := publicCacheServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
@@ -243,15 +243,15 @@ func TestPublicStaticSchemeCanonicalQueryPurgeAndRestartBoundary(t *testing.T) {
 	}
 	for _, item := range []struct{ scheme, query string }{{"https", "b=2&a=1"}, {"http", "b=2&a=1"}, {"https", "a=1&b=2"}} {
 		for range 2 {
-			if got := request(item.scheme, item.query); got.Code != 200 || got.Body.String() != item.scheme+"|1|2" || got.Header().Get("Seen-Query") != "b=2&a=1" {
+			if got := request(item.scheme, item.query); got.Code != 200 || got.Body.String() != item.scheme+"|1|2" || got.Header().Get("Seen-Query") != item.query {
 				t.Fatalf("%d %q", got.Code, got.Body.String())
 			}
 		}
 	}
-	if calls.Load() != 2 {
+	if calls.Load() != 3 {
 		t.Fatalf("cache identity aliased or lost: %d", calls.Load())
 	}
-	if got := request("https", "a=9&b=2"); got.Code != 200 || got.Body.String() != "https|9|2" || calls.Load() != 3 {
+	if got := request("https", "a=9&b=2"); got.Code != 200 || got.Body.String() != "https|9|2" || calls.Load() != 4 {
 		t.Fatalf("distinct query value collided: status=%d body=%q calls=%d", got.Code, got.Body.String(), calls.Load())
 	}
 	purgeRequest := httptest.NewRequest("PURGE", "http://cache.test/item?a=1&b=2", nil)
@@ -263,12 +263,12 @@ func TestPublicStaticSchemeCanonicalQueryPurgeAndRestartBoundary(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("PURGE public selector %d", rec.Code)
 	}
-	for _, item := range []struct{ scheme, query string }{{"http", "a=1&b=2"}, {"https", "b=2&a=9"}} {
-		if got := request(item.scheme, item.query); got.Code != 200 || calls.Load() != 3 {
+	for _, item := range []struct{ scheme, query string }{{"http", "b=2&a=1"}, {"https", "a=9&b=2"}, {"https", "b=2&a=1"}} {
+		if got := request(item.scheme, item.query); got.Code != 200 || calls.Load() != 4 {
 			t.Fatalf("PURGE evicted distinct identity: status=%d origin=%d", got.Code, calls.Load())
 		}
 	}
-	if got := request("https", "b=2&a=1"); got.Code != 200 || calls.Load() != 4 {
+	if got := request("https", "a=1&b=2"); got.Code != 200 || calls.Load() != 5 {
 		t.Fatalf("public PURGE missed namespace: status=%d origin=%d", got.Code, calls.Load())
 	}
 	candidate := *cfg

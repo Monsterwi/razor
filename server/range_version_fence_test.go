@@ -24,16 +24,20 @@ func (w *versionWriteBarrier) Write(p []byte) (int, error) {
 	return w.ResponseWriter.Write(p)
 }
 
-func TestKnownManifestReplacementAbortsOldHTTPStream(t *testing.T) {
-	manifestReplacementStream(t, true)
+func TestKnownObjectReplacementKeepsOldHTTPStream(t *testing.T) {
+	objectReplacementStream(t, true)
 }
-func TestUnchangedManifestRefreshKeepsOldHTTPStream(t *testing.T) {
-	manifestReplacementStream(t, false)
+func TestUnchangedObjectRefreshKeepsOldHTTPStream(t *testing.T) {
+	objectReplacementStream(t, false)
 }
-func manifestReplacementStream(t *testing.T, changedVersion bool) {
+func objectReplacementStream(t *testing.T, changedVersion bool) {
 	old, newer := bytes.Repeat([]byte("a"), 2<<20), bytes.Repeat([]byte("b"), 2<<20)
 	var version atomic.Bool
+	var gets atomic.Int32
 	s, _ := publicCacheServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			gets.Add(1)
+		}
 		body, tag := old, `"v1"`
 		if version.Load() {
 			body, tag = newer, `"v2"`
@@ -59,6 +63,7 @@ func manifestReplacementStream(t *testing.T, changedVersion bool) {
 	defer func() { release.Do(func() { close(resume) }); endpoint.Close() }()
 	type result struct {
 		status int
+		etag   string
 		body   []byte
 		err    error
 	}
@@ -75,7 +80,7 @@ func manifestReplacementStream(t *testing.T, changedVersion bool) {
 		}
 		defer resp.Body.Close()
 		body, err := io.ReadAll(resp.Body)
-		done <- result{resp.StatusCode, body, err}
+		done <- result{resp.StatusCode, resp.Header.Get("ETag"), body, err}
 	}()
 	select {
 	case <-entered:
@@ -93,15 +98,15 @@ func manifestReplacementStream(t *testing.T, changedVersion bool) {
 	if changed.Code != 206 || !bytes.Equal(changed.Body.Bytes(), expected) {
 		t.Fatalf("replacement status=%d bytes=%d", changed.Code, changed.Body.Len())
 	}
+	beforeResume := gets.Load()
 	release.Do(func() { close(resume) })
 	select {
 	case got := <-done:
-		if changedVersion {
-			if got.err == nil || got.status != 206 || len(got.body) > 1<<20 || !bytes.Equal(got.body, old[:len(got.body)]) {
-				t.Fatalf("old stream must abort after observed replacement: status=%d bytes=%d error=%v", got.status, len(got.body), got.err)
-			}
-		} else if got.err != nil || got.status != 206 || !bytes.Equal(got.body, old) {
-			t.Fatalf("unchanged refresh interrupted valid stream: status=%d bytes=%d error=%v", got.status, len(got.body), got.err)
+		if got.err != nil || got.status != 206 || got.etag != `"v1"` || !bytes.Equal(got.body, old) {
+			t.Fatalf("metadata refresh interrupted obtainable old bytes: status=%d bytes=%d error=%v", got.status, len(got.body), got.err)
+		}
+		if gets.Load() != beforeResume {
+			t.Fatalf("old cached stream retried origin: GETs=%d before=%d", gets.Load(), beforeResume)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("old stream did not terminate")

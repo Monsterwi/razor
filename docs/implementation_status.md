@@ -10,12 +10,12 @@
 | 共享缓存语义 | 显式 freshness、Age/Date、s-maxage、请求约束、条件 GET/HEAD、304 更新；不提供启发式 freshness |
 | Vary / 准入 | 仅 Accept-Encoding/Accept-Language 及组合，每 URL 最多 16 普通表示；私有/未知语义保守旁路 |
 | 合并回源 | 回源前原子 join；独立生产者/取消/期限；普通对象完整提交后独立读取 |
-| 部分对象 | manifest + 独立固定块，Range/合格公共大 GET 共用；强 ETag、固定源站和布局，不混版 |
+| 部分对象 | 内部对象元数据 + segment 完成位图 + 独立固定块，Range/合格公共大 GET 共用；强 ETag、固定源站和布局，不混版 |
 | RWW | 首块完整校验并提交后发送，同时最多准备下一块；默认 1 MiB，可配 64 KiB–8 MiB |
-| 离线 Range | 同一仍配置源站的 manifest 和整个所需区间均 fresh、完整可读时零回源；不是 stale-if-error |
+| 离线 Range | 同一仍配置源站的 对象元数据和整个所需区间均 fresh、完整可读时零回源；不是 stale-if-error |
 | RAM | Otter 默认、S3-FIFO 可选；序列化 value + 解码元数据估算计费，非 RSS 硬上限 |
 | 磁盘 | CRC/身份/覆盖代次校验；头片段最后发布；只恢复验证通过的干净检查点 |
-| Query | 原始参数项排序，缓存/任务/PURGE 同规则；源站保证顺序无关，实际回源不重排 |
+| Query | 保留原始参数顺序，缓存/任务/PURGE 同规则；重复参数换序分别缓存，实际回源不重排 |
 | 重载 | 不可变 runtime 租约，原子替换，最多一个未排空旧 runtime；部分设置须重启 |
 
 ## 运行边界
@@ -25,7 +25,7 @@
 | PURGE | 默认关闭；Bearer token 启用；精确/路径前缀失效普通表示与 Range 家族；旧 token 不复活，当前代次可保守影响其他在途任务 |
 | Range | HEAD/总长/强 ETag/identity；多 Range、弱 ETag 等旁路；合成下游响应 no-cache；后块失败中断流 |
 | 容量 | max_object_bytes 默认 64 MiB；大对象测试须调大；块按必要窗口，不要求磁盘容纳整文件 |
-| 索引 | 每 stripe 至多 min(目录容量, 65,536) 映射、16 MiB 键/selector 字符串、每键/selector 16 KiB；URL manifest 快照上限 64 |
+| 索引 | 每 stripe 至多 min(目录容量, 65,536) 映射、16 MiB 键/selector 字符串、每键/selector 16 KiB；URL 对象元数据快照上限 64 |
 | 任务/资源 | 默认 16 生产任务、每任务 256 订阅者、300 秒；请求/源站/写者/读者/队列另限额，非总 RSS 预算 |
 | 持久性 | 提交不等于逐块 fsync；异常退出可冷 MISS，不截断旧文件；同缓存 inode 不跨进程共享 |
 | 未支持 | 未提交字节级 HTTP RWW、多 Range 块缓存、跨节点合并/一致性/PURGE、HTTP/3、io_uring/native AIO |

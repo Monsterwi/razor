@@ -151,10 +151,10 @@ def correctness(client, product, origin, args):
     def query():
         client.checked(product, "/small-query?b=2&a=1")
         before = origin.snapshot()
-        client.checked(product, "/small-query?a=1&b=2")
+        client.checked(product, "/small-query?b=2&a=1")
         assert origin.snapshot() == before
         return before
-    check("query order shares cache", query)
+    check("identical query shares cache", query)
     def cross_client():
         path = "/small-cross-client"
         origin.rules[path] = {"header_delay": .3}
