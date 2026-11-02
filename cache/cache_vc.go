@@ -79,7 +79,11 @@ func newCacheVCWriteLocked(ctx context.Context, token *FillToken) (*CacheVC, err
 	w.generation, w.selector, w.policy = token.generation, token.selector, token.policy
 	w.purgeEpoch = token.purgeEpoch
 	w.fenceSelector, w.fencePolicy = token.fenceSelector, token.fencePolicy
-	if stripe.closing || stripe.storageErr != nil {
+	if stripe.storageErr != nil {
+		w.cancel()
+		return nil, stripe.storageErr
+	}
+	if stripe.closing {
 		w.cancel()
 		return nil, ErrCacheClosed
 	}

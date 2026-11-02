@@ -159,6 +159,10 @@ func (c *Cache) PurgeSelector(selector []byte, prefix bool) ([]string, error) {
 	// Lock in configured order so close cannot publish a clean checkpoint midway.
 	unlock := c.lockStripes()
 	for _, stripe := range c.Stripes {
+		if stripe.storageErr != nil {
+			unlock()
+			return nil, stripe.storageErr
+		}
 		if stripe.closing {
 			unlock()
 			return nil, ErrCacheClosed
