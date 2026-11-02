@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -241,6 +242,18 @@ func TestSharedGETSlowCreatorDoesNotBackpressureOtherSubscriber(t *testing.T) {
 	if err != nil || !bytes.Equal(got, append(prefix, suffix...)) || calls.Load() != 1 {
 		t.Fatalf("slow creator blocked peer: bytes=%d calls=%d err=%v", len(got), calls.Load(), err)
 	}
+	waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillTasks == 0 })
+	// The completed writer must be visible to a new cache lookup even while
+	// the first subscriber still retains its own writer/entry reference.
+	third, err := client.Get(front.URL + "/slow-client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = io.ReadAll(third.Body)
+	third.Body.Close()
+	if err != nil || !bytes.Equal(got, append(prefix, suffix...)) || calls.Load() != 1 {
+		t.Fatalf("retained reader hid committed hit: bytes=%d calls=%d err=%v", len(got), calls.Load(), err)
+	}
 	first.Body.Close()
 	waitFillStats(t, s, func(st server.Stats) bool {
 		return st.SharedFillWaiters == 0 && st.CacheWriters == 0 && st.ResponseBufferInUseBytes == 0
@@ -248,5 +261,40 @@ func TestSharedGETSlowCreatorDoesNotBackpressureOtherSubscriber(t *testing.T) {
 	st := s.Stats()
 	if st.ResponseBufferTotalAllocatedBytes > st.ResponseBufferCapacityBytes || st.BufferReserved != 0 {
 		t.Fatalf("stream retained unbounded or leaked buffers: %+v", st)
+	}
+}
+
+func TestSharedGETImmediateConnectionCloseAfterBodyKeepsCompletedCache(t *testing.T) {
+	body := bytes.Repeat([]byte("x"), 256<<10)
+	var gets atomic.Int32
+	s, _ := publicCacheServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("ETag", `"small"`)
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		if r.Method == http.MethodGet {
+			gets.Add(1)
+			_, _ = w.Write(body)
+		}
+	})
+	front := httptest.NewServer(s)
+	t.Cleanup(front.Close)
+	transport := &http.Transport{DisableKeepAlives: true}
+	t.Cleanup(transport.CloseIdleConnections)
+	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+	for i := range 64 {
+		for range 2 {
+			resp, err := client.Get(fmt.Sprintf("%s/small-%d", front.URL, i))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
+				t.Fatalf("response=%d length=%d err=%v", resp.StatusCode, len(got), err)
+			}
+		}
+		if gets.Load() != int32(i+1) {
+			t.Fatalf("completed response refetched after connection close: path=%d gets=%d", i, gets.Load())
+		}
 	}
 }

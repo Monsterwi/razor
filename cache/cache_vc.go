@@ -191,8 +191,10 @@ func (vc *CacheVC) Close() error {
 		if vc.writing {
 			vc.closeErr = vc.writer.Close()
 			vc.writer.cancel()
+			vc.Stripe.OpenDir.releaseWriter(vc.Key, vc.entry)
+		} else {
+			vc.Stripe.OpenDir.Release(vc.Key, vc.entry)
 		}
-		vc.Stripe.OpenDir.Release(vc.Key, vc.entry)
 	})
 	return vc.closeErr
 }
@@ -210,8 +212,10 @@ func (vc *CacheVC) Abort(err error) {
 		if vc.writing {
 			vc.writer.Abort(err)
 			vc.closeErr = vc.writer.Close()
+			vc.Stripe.OpenDir.releaseWriter(vc.Key, vc.entry)
+		} else {
+			vc.Stripe.OpenDir.Release(vc.Key, vc.entry)
 		}
-		vc.Stripe.OpenDir.Release(vc.Key, vc.entry)
 	})
 }
 

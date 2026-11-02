@@ -373,14 +373,8 @@ func (w *CacheWriter) Close() (closeErr error) {
 	// Notify any remaining readers that we are done (EOF)
 	w.cond.Broadcast()
 
-	// Remove from OpenDir logic is handled by CacheVC / OpenDir wrapper
-	// We don't call OpenDir.CloseWrite here directly anymore to keep layering clean,
-	// or we rely on the OpenDirEntry's refcount.
-	// But strictly speaking, writer finishing means it's no longer the "Active Writer".
-	// The entry might remain for readers.
-
-	// If the OpenDirEntry is linked, we should probably mark it?
-	// But in our new design, the Writer struct persists in the OpenDirEntry.
+	// CacheVC releases active key ownership after Close returns. Existing
+	// subscribers retain this writer independently until their own Close.
 
 	return nil
 }
