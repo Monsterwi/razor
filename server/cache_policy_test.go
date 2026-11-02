@@ -166,11 +166,17 @@ func TestTruncatedOriginDoesNotCommit(t *testing.T) {
 	}
 }
 
-type disconnectedClient struct{ header http.Header }
+type disconnectedClient struct {
+	header      http.Header
+	beforeError func()
+}
 
-func (w *disconnectedClient) Header() http.Header       { return w.header }
-func (w *disconnectedClient) WriteHeader(int)           {}
-func (w *disconnectedClient) Write([]byte) (int, error) { return 0, fmt.Errorf("client disconnected") }
+func (w *disconnectedClient) Header() http.Header { return w.header }
+func (w *disconnectedClient) WriteHeader(int)     {}
+func (w *disconnectedClient) Write([]byte) (int, error) {
+	w.beforeError()
+	return 0, fmt.Errorf("client disconnected")
+}
 
 func TestClientFailureDoesNotDiscardCompletedObject(t *testing.T) {
 	s, calls := cacheServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -183,7 +189,13 @@ func TestClientFailureDoesNotDiscardCompletedObject(t *testing.T) {
 				t.Errorf("transfer abort = %v", got)
 			}
 		}()
-		s.ServeHTTP(&disconnectedClient{make(http.Header)}, httptest.NewRequest("GET", "http://cache.test/item", nil))
+		s.ServeHTTP(&disconnectedClient{
+			header: make(http.Header),
+			beforeError: func() {
+				// RWW can reach the client before publication; fail only after completion.
+				waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillCompleted == 1 })
+			},
+		}, httptest.NewRequest("GET", "http://cache.test/item", nil))
 	}()
 	got := fetch(s, "http://cache.test/item", nil)
 	if calls.Load() != 1 || got.Body.String() != "complete origin" {
