@@ -40,18 +40,19 @@ type CacheWriter struct {
 		allocation allocation
 		size       int
 	}
-	ctx           context.Context
-	cancel        context.CancelFunc
-	fenceSelector []byte
-	fencePolicy   uint64
-	generation    uint64
-	purgeEpoch    uint64
-	purged        atomic.Bool
-	chunkLength   int64
-	policy        uint64
-	selector      []byte
-	version       uint64
-	od            *OpenDirEntry // Reference to OpenDir entry
+	ctx              context.Context
+	cancel           context.CancelFunc
+	fenceSelector    []byte
+	fencePolicy      uint64
+	generation       uint64
+	purgeEpoch       uint64
+	purged           atomic.Bool
+	chunkLength      int64
+	stopStorageWatch func() bool
+	policy           uint64
+	selector         []byte
+	version          uint64
+	od               *OpenDirEntry // Reference to OpenDir entry
 }
 
 func NewCacheWriter(s *Stripe, key []byte) *CacheWriter {
@@ -204,6 +205,10 @@ func (w *CacheWriter) Abort(err error) {
 }
 
 func (w *CacheWriter) abortLocked(err error) {
+	if w.stopStorageWatch != nil {
+		w.stopStorageWatch()
+		w.stopStorageWatch = nil
+	}
 	if err == nil {
 		err = fmt.Errorf("cache write aborted")
 	}
@@ -408,6 +413,10 @@ func (w *CacheWriter) Close() (closeErr error) {
 }
 
 func (w *CacheWriter) finishLocked() {
+	if w.stopStorageWatch != nil {
+		w.stopStorageWatch()
+		w.stopStorageWatch = nil
+	}
 	w.closed = true
 	if len(w.buffer) == 0 {
 		w.buffer = nil
