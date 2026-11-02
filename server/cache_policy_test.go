@@ -2,7 +2,6 @@ package server_test
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -160,15 +159,7 @@ func TestTruncatedOriginDoesNotCommit(t *testing.T) {
 	front := httptest.NewServer(s)
 	defer front.Close()
 	for range 2 {
-		resp, err := http.Get(front.URL + "/item")
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil || resp.StatusCode != http.StatusBadGateway {
-			t.Fatalf("incomplete origin response: status=%d err=%v", resp.StatusCode, err)
-		}
+		assertFailedSharedHTTP(t, front.Client(), front.URL+"/item")
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("truncated response cached: %d origin calls", calls.Load())
@@ -346,15 +337,7 @@ func TestTruncatedChunkedOriginAbortsDownstream(t *testing.T) {
 	front := httptest.NewServer(s)
 	defer front.Close()
 	for range 2 {
-		resp, err := http.Get(front.URL + "/item")
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil || resp.StatusCode != http.StatusBadGateway {
-			t.Fatalf("truncated chunked origin status=%d err=%v", resp.StatusCode, err)
-		}
+		assertFailedSharedHTTP(t, front.Client(), front.URL+"/item")
 	}
 	if calls.Load() != 2 {
 		t.Fatal("truncated response was cached")
@@ -372,8 +355,11 @@ func TestLateTrailersPreventCaching(t *testing.T) {
 		fmt.Fprint(rw, "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=3600\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nSet-Cookie: user=alice\r\n\r\n")
 		rw.Flush()
 	})
-	fetch(s, "http://cache.test/item", nil)
-	fetch(s, "http://cache.test/item", nil)
+	front := httptest.NewServer(s)
+	defer front.Close()
+	for range 2 {
+		assertFailedSharedHTTP(t, front.Client(), front.URL+"/item")
+	}
 	if calls.Load() != 2 {
 		t.Fatal("unannounced late response trailers were cached")
 	}

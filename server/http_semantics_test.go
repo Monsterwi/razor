@@ -547,12 +547,13 @@ func TestUnsafeResponseFencesAlreadyReservedWriter(t *testing.T) {
 				}
 				fmt.Fprint(w, "new")
 			})
-			target := "http://cache.test/item"
-			first := httptest.NewRecorder()
+			front := httptest.NewServer(s)
+			defer front.Close()
+			target := front.URL + "/item"
 			firstDone := make(chan struct{})
 			go func() {
 				defer close(firstDone)
-				s.ServeHTTP(first, httptest.NewRequest("GET", target, nil))
+				assertFailedSharedHTTP(t, front.Client(), target)
 			}()
 			<-firstEntered
 			unsafeDone := make(chan *httptest.ResponseRecorder, 1)
@@ -565,8 +566,8 @@ func TestUnsafeResponseFencesAlreadyReservedWriter(t *testing.T) {
 			close(firstBody)
 			<-firstDone
 			got := fetch(s, target, nil)
-			if first.Code != http.StatusBadGateway || unsafe.Body.String() != "new" || got.Body.String() != "new" || calls.Load() != 3 {
-				t.Fatalf("first=%q unsafe=%q next=%q origin calls=%d", first.Body.String(), unsafe.Body.String(), got.Body.String(), calls.Load())
+			if unsafe.Body.String() != "new" || got.Body.String() != "new" || calls.Load() != 3 {
+				t.Fatalf("unsafe=%q next=%q origin calls=%d", unsafe.Body.String(), got.Body.String(), calls.Load())
 			}
 		})
 	}

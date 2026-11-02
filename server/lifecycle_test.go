@@ -218,6 +218,7 @@ func TestCacheWriterQueueCancellationAndOverflow(t *testing.T) {
 		defer close(firstDone)
 		resp, _ := frontend.Client().Do(firstRequest)
 		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 		}
 	}()
@@ -289,14 +290,7 @@ func TestOversizedUnknownLengthFillFailsAndReleasesReservation(t *testing.T) {
 	s := lifecycleServer(t, origin.URL, cfg)
 	frontend := httptest.NewServer(s)
 	defer frontend.Close()
-	resp, err := frontend.Client().Get(frontend.URL + "/large")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("oversized candidate status=%d", resp.StatusCode)
-	}
+	assertFailedSharedHTTP(t, frontend.Client(), frontend.URL+"/large")
 	deadline := time.After(time.Second)
 	for {
 		st := s.Stats()
@@ -321,6 +315,7 @@ func TestCacheCommitFailureDoesNotPublishOrigin(t *testing.T) {
 		calls.Add(1)
 		w.Header().Set("Cache-Control", "public, max-age=60")
 		io.WriteString(w, "complete origin body")
+		w.(http.Flusher).Flush()
 	}))
 	defer origin.Close()
 	cfg := appconfig.GetDefaultConfig()
@@ -339,15 +334,13 @@ func TestCacheCommitFailureDoesNotPublishOrigin(t *testing.T) {
 	}
 	s := server.New(cfg, c, p)
 	defer s.Shutdown()
+	front := httptest.NewServer(s)
+	defer front.Close()
 	if err = c.Stripes[0].Fd.Close(); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
-		w := httptest.NewRecorder()
-		s.ServeHTTP(w, httptest.NewRequest("GET", "http://front.test/object", nil))
-		if w.Code != http.StatusBadGateway {
-			t.Fatalf("cache error published uncommitted origin: %d %q", w.Code, w.Body.String())
-		}
+		assertFailedSharedHTTP(t, front.Client(), front.URL+"/object")
 	}
 	st := s.Stats()
 	if calls.Load() != 2 || st.CacheWriteErrors == 0 || st.CacheWriters != 0 || st.BufferReserved != 0 {

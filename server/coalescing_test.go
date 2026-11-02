@@ -336,19 +336,25 @@ func TestFailedFillWakesHundredSubscribersWithoutRetry(t *testing.T) {
 		w.Header().Set("Content-Length", "100")
 		fmt.Fprint(w, "truncated")
 	})
-	first := startFill(s, context.Background(), nil)
+	front := httptest.NewServer(s)
+	defer front.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+	done := make(chan struct{}, 100)
+	start := func() {
+		go func() {
+			assertFailedSharedHTTP(t, client, front.URL+"/item")
+			done <- struct{}{}
+		}()
+	}
+	start()
 	<-entered
-	followers := make([]<-chan *httptest.ResponseRecorder, 99)
-	for i := range followers {
-		followers[i] = startFill(s, context.Background(), nil)
+	for range 99 {
+		start()
 	}
 	waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillWaiters == 100 })
 	close(release)
-	for _, done := range append(followers, first) {
-		got := <-done
-		if got.Code != 502 {
-			t.Fatalf("incomplete response published: %d %q", got.Code, got.Body.String())
-		}
+	for range 100 {
+		<-done
 	}
 	waitFillStats(t, s, func(st server.Stats) bool {
 		return st.SharedFillTasks == 0 && st.SharedFillWaiters == 0 && st.CacheWriters == 0 && st.Origin.InFlight == 0

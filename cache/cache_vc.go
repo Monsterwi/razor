@@ -113,7 +113,11 @@ func (vc *CacheVC) OpenReader(ctx context.Context) (*CacheVC, error) {
 		return nil, err
 	}
 	vc.Stripe.mu.Lock()
-	if vc.Stripe.closing || vc.generation != vc.Stripe.OpenDir.Generation() {
+	if vc.Stripe.closing {
+		vc.Stripe.mu.Unlock()
+		return nil, ErrCacheClosed
+	}
+	if vc.generation != vc.Stripe.OpenDir.Generation() {
 		vc.Stripe.mu.Unlock()
 		return nil, ErrInvalidated
 	}

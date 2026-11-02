@@ -171,15 +171,9 @@ func (w *CacheWriter) ReadAtContext(ctx context.Context, offset int64, p []byte)
 			w.mutex.Unlock()
 			return 0, err
 		}
-		if w.closed {
-			err := w.err
-			w.mutex.Unlock()
-			if err != nil {
-				return 0, err
-			}
-			return 0, io.EOF
-		}
-		if w.totalWritten > offset {
+		// Write and Close may both run while upgrading the lock. Recheck data
+		// and errors at the top before deciding that a closed writer means EOF.
+		if w.closed || w.totalWritten > offset || w.err != nil {
 			w.mutex.Unlock()
 			continue
 		}
