@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 )
 
 // CacheWriter handles writing data to the cache.
@@ -43,6 +45,9 @@ type CacheWriter struct {
 	fenceSelector []byte
 	fencePolicy   uint64
 	generation    uint64
+	purgeEpoch    uint64
+	purged        atomic.Bool
+	chunkLength   int64
 	policy        uint64
 	selector      []byte
 	version       uint64
@@ -56,6 +61,7 @@ func NewCacheWriter(s *Stripe, key []byte) *CacheWriter {
 		ctx:        ctx,
 		cancel:     cancel,
 		generation: s.OpenDir.Generation(),
+		purgeEpoch: s.OpenDir.purgeEpoch.Load(),
 		policy:     s.OpenDir.policyEpoch(key).Load(),
 		selector:   append([]byte(nil), key...),
 		Key:        append([]byte(nil), key...),
@@ -247,6 +253,19 @@ func (w *CacheWriter) Write(p []byte) (n int, err error) {
 		w.abortLocked(err)
 		return 0, err
 	}
+	if w.chunkLength > 0 {
+		w.Stripe.mu.RLock()
+		err := w.publicationErrorLocked()
+		w.Stripe.mu.RUnlock()
+		if err != nil && !errors.Is(err, ErrPurged) {
+			w.abortLocked(err)
+			return 0, err
+		}
+		if int64(len(p)) > w.chunkLength-w.totalWritten {
+			w.abortLocked(errors.New("partial chunk exceeds declared length"))
+			return 0, w.err
+		}
+	}
 	if int64(len(p)) > w.Stripe.Skip+w.Stripe.Len-w.Stripe.Start-w.totalWritten {
 		err := fmt.Errorf("object exceeds stripe data area")
 		w.abortLocked(err)
@@ -320,6 +339,22 @@ func (w *CacheWriter) Close() (closeErr error) {
 			w.abortLocked(closeErr)
 		}
 	}()
+	if w.chunkLength > 0 {
+		w.Stripe.mu.RLock()
+		err := w.publicationErrorLocked()
+		w.Stripe.mu.RUnlock()
+		if err != nil && !errors.Is(err, ErrPurged) {
+			return err
+		}
+		if w.totalWritten != w.chunkLength {
+			return io.ErrUnexpectedEOF
+		}
+		if errors.Is(err, ErrPurged) {
+			w.purged.Store(true)
+			w.finishLocked()
+			return nil
+		}
+	}
 
 	// Serialize Metadata (CacheHTTPInfo) for Fragment 0
 	var infoBytes []byte
@@ -361,13 +396,26 @@ func (w *CacheWriter) Close() (closeErr error) {
 		// This is the commit point.
 		err := w.writeFragment(0, w.frag0Data, infoBytes)
 		if err != nil {
-			return err
+			if w.chunkLength == 0 || !errors.Is(err, ErrPurged) {
+				return err
+			}
+			w.purged.Store(true)
 		}
 	}
 
+	w.finishLocked()
+	return nil
+}
+
+func (w *CacheWriter) finishLocked() {
 	w.closed = true
-	w.buffer = nil
-	w.frag0Data = nil
+	if len(w.buffer) == 0 {
+		w.buffer = nil
+	}
+	if w.chunkLength == 0 {
+		w.buffer = nil
+		w.frag0Data = nil
+	}
 	w.published = nil
 	// Terminal readability and active-key ownership change under the same writer lock.
 	w.Stripe.OpenDir.releaseWriter(w.Key, w.od)
@@ -377,11 +425,16 @@ func (w *CacheWriter) Close() (closeErr error) {
 	// Notify any remaining readers that we are done (EOF)
 	w.cond.Broadcast()
 
-	return nil
 }
 
 // writeFragment writes a single fragment to storage.
 func (w *CacheWriter) writeFragment(idx int, data []byte, infoBytes []byte) error {
+	w.Stripe.mu.RLock()
+	err := w.publicationErrorLocked()
+	w.Stripe.mu.RUnlock()
+	if err != nil {
+		return err
+	}
 	// Determine keys
 	thisKey := FragmentKey(w.Key, idx)
 
@@ -439,17 +492,8 @@ func (w *CacheWriter) writeFragment(idx int, data []byte, infoBytes []byte) erro
 	}
 	w.Stripe.mu.Lock()
 	defer w.Stripe.mu.Unlock()
-	if w.Stripe.storageErr != nil {
-		return w.Stripe.storageErr
-	}
-	if err := w.ctx.Err(); err != nil {
+	if err := w.publicationErrorLocked(); err != nil {
 		return err
-	}
-	if w.Stripe.closing {
-		return ErrCacheClosed
-	}
-	if (len(w.fenceSelector) > 0 && w.fencePolicy != w.Stripe.OpenDir.policyEpoch(w.fenceSelector).Load()) || w.generation != w.Stripe.OpenDir.Generation() || w.policy != w.Stripe.OpenDir.policyEpoch(w.selector).Load() || (w.od != nil && w.Stripe.OpenDir.Get(w.Key) != w.od) {
-		return ErrInvalidated
 	}
 	if !w.Stripe.allocationValid(a, len(fullData)) {
 		return fmt.Errorf("fragment overwritten before publication")
@@ -478,6 +522,31 @@ func (w *CacheWriter) writeFragment(idx int, data []byte, infoBytes []byte) erro
 		if err := w.Stripe.DirMgr.DirTrie.SetIdentity(w.Key, w.selector); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (w *CacheWriter) publicationErrorLocked() error {
+	if w.Stripe.storageErr != nil {
+		return w.Stripe.storageErr
+	}
+	if w.Stripe.closing || w.Stripe.disk == nil {
+		return ErrCacheClosed
+	}
+	if err := w.ctx.Err(); err != nil {
+		return err
+	}
+	if (len(w.fenceSelector) > 0 && w.fencePolicy != w.Stripe.OpenDir.policyEpoch(w.fenceSelector).Load()) || w.generation != w.Stripe.OpenDir.Generation() || w.policy != w.Stripe.OpenDir.policyEpoch(w.selector).Load() {
+		return ErrInvalidated
+	}
+	if w.purged.Load() {
+		return ErrPurged
+	}
+	if err := w.Stripe.OpenDir.checkPurge(w.purgeEpoch, w.selector); err != nil {
+		return err
+	}
+	if w.od != nil && w.Stripe.OpenDir.Get(w.Key) != w.od {
+		return ErrInvalidated
 	}
 	return nil
 }

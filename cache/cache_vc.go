@@ -35,6 +35,7 @@ func NewCacheVCRead(stripe *Stripe, key []byte) (*CacheVC, error) {
 		return nil, ErrCacheClosed
 	}
 	vc.generation = stripe.OpenDir.Generation()
+	purgeEpoch := stripe.OpenDir.purgeEpoch.Load()
 	vc.entry = stripe.OpenDir.Acquire(key)
 	stripe.mu.Unlock()
 	if vc.entry != nil {
@@ -43,6 +44,7 @@ func NewCacheVCRead(stripe *Stripe, key []byte) (*CacheVC, error) {
 		vc.reader = NewCacheReader(stripe, key)
 	}
 	vc.reader.ctx = ctx
+	vc.reader.purgeEpoch = purgeEpoch
 	return vc, nil
 }
 
@@ -75,6 +77,7 @@ func newCacheVCWriteLocked(ctx context.Context, token *FillToken) (*CacheVC, err
 	w.cancel()
 	w.ctx, w.cancel = context.WithCancel(ctx)
 	w.generation, w.selector, w.policy = token.generation, token.selector, token.policy
+	w.purgeEpoch = token.purgeEpoch
 	w.fenceSelector, w.fencePolicy = token.fenceSelector, token.fencePolicy
 	if stripe.closing || stripe.storageErr != nil {
 		w.cancel()
@@ -83,6 +86,10 @@ func newCacheVCWriteLocked(ctx context.Context, token *FillToken) (*CacheVC, err
 	if token.generation != stripe.OpenDir.Generation() || token.policy != stripe.OpenDir.policyEpoch(token.selector).Load() || (len(token.fenceSelector) > 0 && token.fencePolicy != stripe.OpenDir.policyEpoch(token.fenceSelector).Load()) {
 		w.cancel()
 		return nil, ErrInvalidated
+	}
+	if err := stripe.OpenDir.checkPurge(token.purgeEpoch, token.selector); err != nil {
+		w.cancel()
+		return nil, err
 	}
 	if stripe.OpenDir.Get(key) != nil {
 		w.cancel()
@@ -145,6 +152,9 @@ func (vc *CacheVC) CommittedRevision() (uint64, error) {
 	}
 	if !vc.writer.closed {
 		return 0, fmt.Errorf("writer has not committed")
+	}
+	if vc.writer.purged.Load() {
+		return 0, ErrPurged
 	}
 	return vc.writer.version, nil
 }

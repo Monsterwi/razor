@@ -44,6 +44,8 @@ type OpenDir struct {
 	mutex        sync.RWMutex
 	entries      map[string]*OpenDirEntry
 	generation   atomic.Uint64
+	purgeEpoch   atomic.Uint64
+	purges       [purgeHistorySize]purgeEvent
 	policyEpochs [1024]atomic.Uint64
 }
 
@@ -161,6 +163,17 @@ func (od *OpenDir) detach(key []byte) *OpenDirEntry {
 		if entry.Writer.cancel != nil {
 			entry.Writer.cancel()
 		}
+	}
+	return entry
+}
+
+func (od *OpenDir) retirePartial(key []byte) *OpenDirEntry {
+	od.mutex.Lock()
+	defer od.mutex.Unlock()
+	entry := od.entries[string(key)]
+	delete(od.entries, string(key))
+	if entry != nil && entry.Writer.chunkLength > 0 {
+		entry.Writer.purged.Store(true)
 	}
 	return entry
 }
