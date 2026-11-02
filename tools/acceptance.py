@@ -814,7 +814,8 @@ def main():
     p.add_argument("--public-static", action="store_true", help="explicit public identity contract; required for public-functional and soak")
     p.add_argument("--ram-algorithm", choices=("otter", "s3-fifo"), default="otter")
     p.add_argument("--ram-bytes", type=int, default=10 * MIB, help="same per-stripe payload budget for policy comparison")
-    p.add_argument("--block-bytes", type=int, default=MIB)
+    p.add_argument("--block-bytes", type=int, choices=(MIB,), default=MIB,
+                   help="compatibility option; chunk size is fixed at 1 MiB")
     p.add_argument("--soak-seconds", type=float, default=7200)
     p.add_argument("--allow-short-soak", action="store_true", help="smoke test only; never qualifies as two-hour acceptance")
     p.add_argument("--cache-root", type=Path, help="new Razor cache directory on the disk under test; results stay under --output")

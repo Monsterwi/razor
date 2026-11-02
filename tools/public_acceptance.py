@@ -232,25 +232,19 @@ def public_functional(args, fixtures, output, smoke=False):
         origin.healthy = True
         wait_for(lambda: client.request(product, "/small-health-probe", headers={"Authorization": "Bearer probe"}, status=None)["status"] == 200,
                  "origin recovered", 10)
-        # Restart with a different block layout, then revert without deleting the old files.
-        product.stop()
-        original = product.config["cache.range_block_bytes"]
-        product.config["cache.range_block_bytes"] = ("INT", 64 << 10 if block != 64 << 10 else MIB)
-        product.write_config()
-        product.start()
-        product.stats_offset = 0
-        before = origin.snapshot(path)
-        client.checked(product, path, headers={"Range": "bytes=0-16"}, status=206, expected=client.expected(path, bounds=(0, 16)))
-        assert origin.snapshot(path)["bytes"] > before["bytes"]
-        product.stop()
-        product.config["cache.range_block_bytes"] = original
-        product.write_config()
-        product.start()
-        product.stats_offset = 0
-        before = origin.snapshot(path)
-        client.checked(product, path, headers={"Range": "bytes=0-16"}, status=206, expected=client.expected(path, bounds=(0, 16)))
-        assert origin.snapshot(path) == before
-        record(output, evidence, "layout restart isolation and revert reuse", drain=drain(product))
+        # Reopening the same fixed geometry must retain the committed chunk.
+        for bounds in ((0, 16), (block - 17, block - 1)):
+            product.stop()
+            product.start()
+            product.stats_offset = 0
+            before = origin.snapshot(path)
+            response = client.checked(product, path, headers={"Range": f"bytes={bounds[0]}-{bounds[1]}"},
+                                      status=206, expected=client.expected(path, bounds=bounds))
+            headers = {name.lower(): value for name, value in response["headers"].items()}
+            assert headers["content-length"] == "17", response
+            assert headers["content-range"] == f"bytes {bounds[0]}-{bounds[1]}/{large}", response
+            assert origin.snapshot(path) == before
+        record(output, evidence, "fixed 1 MiB chunk survives repeated clean restart", drain=drain(product))
     return evidence
 
 
