@@ -13,8 +13,13 @@ sequenceDiagram
     O->>W: 合法响应头与部分正文
     W-->>R: 当前可读字节
     O->>W: 剩余正文与结束
-    W->>W: 校验并提交数据
-    W->>B: 更新完成位
+    W->>W: 完整性校验
+    alt 仍有缓存发布权
+        W->>W: 提交数据与目录
+        W->>B: 更新完成位
+    else 已开始响应遇到 PURGE
+        W->>W: 完成私有块，不发布目录或位图
+    end
     W-->>R: 完成通知与保留的末字节
 ```
 
@@ -32,7 +37,7 @@ sequenceDiagram
 | 阶段 | 保证 |
 | --- | --- |
 | 接收 | 先确认精确区间/ETag/长度/编码与无 Trailer，再经共享 writer 输出在途字节 |
-| 提交 | 复用 CacheVC/cacheFill；一个块可含多个 fragment，头片段最后写；CRC、所有权和失效围栏均有效 |
+| 提交 | 复用 CacheVC/cacheFill；当前 1 MiB chunk 的正文对应一个 Doc fragment，末块可短；CRC、所有权和发布权围栏均有效。普通整对象仍可含多个 fragment，头片段最后写 |
 | 发送 | 完成位规划命中；命中读取仍校验，缺块订阅绑定确切 writer；按客户端独立偏移裁剪 |
 | 背压 | 写者和读者各有额度；生产者独立于客户端，最后订阅者取消时停止回源 |
 | 淘汰 | 已准备块并非永久 pinned；丢失后按原 token、源站、ETag 受控补块；独立校验字节可完成当前发送 |
@@ -59,10 +64,12 @@ sequenceDiagram
 
 Plan A 固定每个 chunk 为 1 MiB、每个 segment 包含 64 个 chunk。兼容配置项 `proxy.config.cache.range_block_bytes` 仅接受 1048576；其他值拒绝加载。
 
-代码：[serveBlocks](../server/range_cache.go)、[位图与区间规划](../server/range_plan.go)。回归：[跨块/segment/取消](../server/partial_range_test.go)、[首块屏障/共享](../server/rww_test.go)、[淘汰](../server/rww_eviction_test.go)、[版本围栏](../server/range_version_fence_test.go)。
+代码：[serveBlocks](../server/range_cache.go)、[位图与区间规划](../server/range_plan.go)。回归：[块内 RWW 与失败](../server/partial_chunk_test.go)、[GET/Range 双向共享](../server/partial_get_test.go)、[跨块/segment/取消](../server/partial_range_test.go)、[PURGE 续流与私有共享](../server/partial_purge_test.go)、[淘汰](../server/rww_eviction_test.go)、[版本围栏](../server/range_version_fence_test.go)。
 
 ```bash
-go test ./server -run 'Test(RangeCommittedBlockArrivesBeforeSecondBlock|PublicGETCommittedBlockArrivesBeforeSecondBlock|PublicGETAndOverlappingRangeShareBlockProducers|RangeOnlyFetchesMissingAlignedUnion|CommittedBlockStreamAbortsOnLaterOriginFailure)$' -count=1 -timeout 120s
+go test ./server -run 'Test(ColdGETStreamsOnceAndFeedsRangeCache|GETReusesInFlightRangeAndOnlyFetchesRemainingChunks|RangeOnlyFetchesMissingAlignedUnion|PartialPurgeKeepsStartedResponseAndSeparatesNewGeneration|PartialPurgeOldRangeVersionFailureDoesNotRetryOrRetireNew|PartialPurgeOldCursorsShareSubsequentPrivateRun)$' -count=1 -timeout 120s
 ```
 
-PURGE 后的私有块继续使用 `CacheVC.OpenReader`，每个 writer 最多1MiB；普通 GET 仅持当前 slot，Range run 最多两个 slot。完成 writer 的当前块字节保留到确切 reader/slot 释放，旧 reader 不会读到同 key replacement。后续未启动的 run 可以按原 ETag 私有回源；若旧版本不可取得，响应异常结束且不重试为新版。
+PURGE 后的私有块继续使用 `CacheVC.OpenReader`，每个 writer 最多 1 MiB；普通 GET 仅持当前 slot，Range run 最多两个 slot。完成 writer 的当前块字节保留到确切 reader/slot 释放，旧 reader 不会读到同 key replacement。后续未启动的 run 可以按原 ETag 私有回源；已经开始的旧响应仍共享同一旧代次、相容身份的重叠在途区间，新请求不能加入。若旧版本不可取得，响应异常结束且不重试为新版。
+
+私有续流不保存整对象历史。慢读者所需的已完成旧块若已离开有界窗口且缓存不可读，可受控补取一次同版本单块；这会增加 PURGE 后的回源字节，不能将有界内存等同于零额外回源。

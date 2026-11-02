@@ -29,7 +29,7 @@ RAM 是磁盘之上的可淘汰加速层；默认 Otter v2.2.1（adaptive W-Tiny
 
 | 字段 | 口径 |
 | --- | --- |
-| ResidentBytes | 序列化 value 的 len 合计；含 Doc/HTTP/manifest，不是纯正文 |
+| ResidentBytes | 序列化 value 的 len 合计；含 Doc、HTTP 和部分对象元数据记录，不是纯正文 |
 | ChargedBytes / DecodedMetadataBytes | 策略权重 / 已计入权重的解码估算 |
 | EstimatedMetadataBytes | node/key 估算 128 + key bytes，再加解码估算；不含 map 空桶、allocator、sketch/buffer/runtime |
 | GhostBytes | 被记住的旧 value 权重，非实际保存的正文 |
@@ -55,4 +55,4 @@ go test -race ./cache -run 'TestRAM|TestS3FIFO' -count=1
 go test ./cache -run '^$' -bench '^BenchmarkRAMTrace$' -benchmem -benchtime=2s -count=3
 ```
 
-10 MiB、256 B/256 KiB/1 MiB/4 MiB、0.5/1/4 倍工作集，覆盖扫描/热点切换/混合读写。逻辑 MB/s 不复制全部正文，不能当 HTTP 或磁盘吞吐。当前仅保留 [最新热命中压测](benchmarks/ats_comparison_2026-10-24.md)，不能据此比较淘汰策略或长测稳定性。
+10 MiB、256 B/256 KiB/1 MiB/4 MiB、0.5/1/4 倍工作集，覆盖扫描/热点切换/混合读写。逻辑 MB/s 不复制全部正文，不能当 HTTP 或磁盘吞吐。历史结果见 [2026-10-24 热命中压测](benchmarks/ats_comparison_2026-10-24.md)，不能据此比较淘汰策略或长测稳定性。

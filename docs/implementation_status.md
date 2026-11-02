@@ -9,9 +9,9 @@
 | HTTP | 标准库代理、TLS/H2、可信转发、源站证书校验、健康探测、取消和排空 |
 | 共享缓存语义 | 显式 freshness、Age/Date、s-maxage、请求约束、条件 GET/HEAD、304 更新；不提供启发式 freshness |
 | Vary / 准入 | 仅 Accept-Encoding/Accept-Language 及组合，每 URL 最多 16 普通表示；私有/未知语义保守旁路 |
-| 合并回源 | 回源前原子 join；独立生产者/取消/期限；普通对象完整提交后独立读取 |
+| 合并回源 | 回源前原子 join；独立生产者/取消/期限；合法头部后绑定确切 writer，独立读取在途字节 |
 | 部分对象 | 内部对象元数据 + segment 完成位图 + 独立固定块，Range/合格普通 GET 共用（含小对象）；冷 GET 一次普通回源、无 HEAD；强 ETag、固定源站和布局，不混版 |
-| RWW | 首块完整校验并提交后发送，同时最多准备下一块；默认 1 MiB，可配 64 KiB–8 MiB |
+| RWW | 响应头校验后可发送块内前缀，完整校验提交后才置完成位；固定 1 MiB/chunk、64 chunk/segment |
 | 离线 Range | 同一仍配置源站的 对象元数据和整个所需区间均 fresh、完整可读时零回源；不是 stale-if-error |
 | RAM | Otter 默认、S3-FIFO 可选；序列化 value + 解码元数据估算计费，非 RSS 硬上限 |
 | 磁盘 | CRC/身份/覆盖代次校验；头片段最后发布；只恢复验证通过的干净检查点 |
@@ -32,9 +32,9 @@
 
 完整边界：[填充/失效](cache_fill_design.md)、[RWW](rww_implementation.md)、[RAM](ram_cache.md)、[存储](cache_storage_format.md)。
 
-## 最新压测
+## 历史压测
 
-仅保留 [2026-10-24 结果](benchmarks/ats_comparison_2026-10-24.md)，测量源码 `8581267`。
+以下保留 [2026-10-24 结果](benchmarks/ats_comparison_2026-10-24.md)，测量源码 `8581267`。
 
 | 范围 | 结果 |
 | --- | --- |

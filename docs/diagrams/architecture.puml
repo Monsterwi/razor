@@ -28,8 +28,8 @@ H --> P : 不可缓存请求旁路
 F --> R : 生产者独立租约
 F --> P : 唯一生产者回源
 P --> O : GET / HEAD / 对齐 Range
-F --> K : 校验后提交
+F --> K : 在途 RWW / 校验后发布
 K --> M : 内存加速
-K --> S : 完整对象 / manifest / 块
+K --> S : 整对象 / 对象元数据 / segment 位图 / chunk
 S --> D : ReadAt / WriteAt
 @enduml
