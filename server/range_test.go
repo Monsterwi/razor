@@ -56,8 +56,8 @@ func (w *countRangeBytes) Write(p []byte) (int, error) {
 }
 
 func TestRangeVersionChangeRejectsMixedBodyAndRecovers(t *testing.T) {
-	old := bytes.Repeat([]byte("a"), 2<<20)
-	newer := bytes.Repeat([]byte("b"), 2<<20)
+	old := bytes.Repeat([]byte("a"), 3<<20)
+	newer := bytes.Repeat([]byte("b"), 3<<20)
 	var version atomic.Int32
 	version.Store(1)
 	var gets atomic.Int32
@@ -75,8 +75,11 @@ func TestRangeVersionChangeRejectsMixedBodyAndRecovers(t *testing.T) {
 		w.Header().Set("Cache-Control", "public,max-age=3600")
 		http.ServeContent(w, r, "body", time.Time{}, bytes.NewReader(data))
 	})
-	assertIncompleteRange(t, s, "bytes=0-2097151", 2<<20)
-	got := fetch(s, "http://cache.test/item", http.Header{"Range": {"bytes=0-2097151"}})
+	assertIncompleteRange(t, s, "bytes=0-3145727", 3<<20)
+	if gets.Load() != 2 {
+		t.Fatalf("version change retried current request: GET=%d", gets.Load())
+	}
+	got := fetch(s, "http://cache.test/item", http.Header{"Range": {"bytes=0-3145727"}})
 	if got.Code != 206 || !bytes.Equal(got.Body.Bytes(), newer) {
 		t.Fatalf("new version recovery status=%d length=%d", got.Code, got.Body.Len())
 	}
@@ -243,14 +246,23 @@ func TestRangePurgeFencesAllBlocksAndKeepsAdjacentURL(t *testing.T) {
 	s, _ := purgeServer(t, "test-secret", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", `"one"`)
 		w.Header().Set("Cache-Control", "public,max-age=3600")
-		if r.URL.Path == "/item" && r.Header.Get("Range") == "bytes=0-1048575" {
+		if start, _, ok := originInterval(r); r.URL.Path == "/item" && ok && start == 0 {
 			firstBlockGets.Add(1)
 		}
-		if r.URL.Path == "/item" && r.Header.Get("Range") == "bytes=1048576-2097151" && blocked.CompareAndSwap(false, true) {
-			close(entered)
-			<-release
-		}
 		var out http.ResponseWriter = w
+		if r.URL.Path == "/item" {
+			out = &originBoundaryWriter{ResponseWriter: w, boundary: 1 << 20, cross: func() error {
+				if blocked.CompareAndSwap(false, true) {
+					close(entered)
+					select {
+					case <-release:
+					case <-r.Context().Done():
+						return r.Context().Err()
+					}
+				}
+				return nil
+			}}
+		}
 		if r.URL.Path == "/item-adjacent" {
 			out = &countRangeBytes{ResponseWriter: w, bytes: &adjacentBytes}
 		}
@@ -327,14 +339,11 @@ func TestRangeCleanRestartReusesCompleteBlocksAndRefetchesInterruptedBlock(t *te
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", `"one"`)
 		w.Header().Set("Cache-Control", "public,max-age=3600")
-		if broken.Load() && r.Header.Get("Range") == "bytes=1048576-2097151" {
-			w.Header().Set("Content-Range", "bytes 1048576-2097151/2097152")
-			w.Header().Set("Content-Length", "1048576")
-			w.WriteHeader(206)
-			w.Write([]byte("cut"))
-			return
+		var out http.ResponseWriter = &countRangeBytes{ResponseWriter: w, bytes: &originBytes}
+		if broken.Load() {
+			out = &originBoundaryWriter{ResponseWriter: out, boundary: (1 << 20) + 3, cross: func() error { return io.ErrUnexpectedEOF }}
 		}
-		http.ServeContent(&countRangeBytes{ResponseWriter: w, bytes: &originBytes}, r, "body", time.Time{}, bytes.NewReader(data))
+		http.ServeContent(out, r, "body", time.Time{}, bytes.NewReader(data))
 	}))
 	defer upstream.Close()
 	path := filepath.Join(t.TempDir(), "cache")
@@ -346,7 +355,7 @@ func TestRangeCleanRestartReusesCompleteBlocksAndRefetchesInterruptedBlock(t *te
 	broken.Store(false)
 	next, _ := newRangeDiskServer(t, path, 32<<20, []string{upstream.URL}, 64<<20)
 	got := fetch(next, "http://cache.test/item", http.Header{"Range": {"bytes=0-2097151"}})
-	if got.Code != 206 || !bytes.Equal(got.Body.Bytes(), data) || originBytes.Load() != 2<<20 {
+	if got.Code != 206 || !bytes.Equal(got.Body.Bytes(), data) || originBytes.Load() != (2<<20)+3 {
 		t.Fatalf("restart status=%d length=%d total origin=%d", got.Code, got.Body.Len(), originBytes.Load())
 	}
 }

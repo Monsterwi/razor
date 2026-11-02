@@ -19,6 +19,56 @@ import (
 	"time"
 )
 
+// originBoundaryWriter gates or fails at an absolute object offset, independent
+// of whether the cache requested one chunk or a merged run.
+type originBoundaryWriter struct {
+	http.ResponseWriter
+	boundary, offset     int64
+	initialized, crossed bool
+	cross                func() error
+}
+
+func (w *originBoundaryWriter) Write(p []byte) (int, error) {
+	if !w.initialized {
+		_, _ = fmt.Sscanf(w.Header().Get("Content-Range"), "bytes %d-", &w.offset)
+		w.initialized = true
+	}
+	written := 0
+	if !w.crossed {
+		before := min(int64(len(p)), max(w.boundary-w.offset, int64(0)))
+		if before > 0 {
+			n, err := w.ResponseWriter.Write(p[:before])
+			written += n
+			w.offset += int64(n)
+			if err != nil {
+				return written, err
+			}
+			if int64(n) != before {
+				return written, io.ErrShortWrite
+			}
+			p = p[before:]
+		}
+		if len(p) == 0 {
+			return written, nil
+		}
+		w.crossed = true
+		if flush, ok := w.ResponseWriter.(http.Flusher); ok {
+			flush.Flush()
+		}
+		if err := w.cross(); err != nil {
+			return written, err
+		}
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.offset += int64(n)
+	return written + n, err
+}
+func originInterval(r *http.Request) (int64, int64, bool) {
+	var start, end int64
+	n, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end)
+	return start, end, err == nil && n == 2
+}
+
 func TestRangeCommittedBlockArrivesBeforeSecondBlock(t *testing.T) { committedBlockBarrier(t, false) }
 func TestPublicGETCommittedBlockArrivesBeforeSecondBlock(t *testing.T) {
 	committedBlockBarrier(t, true)
@@ -31,11 +81,16 @@ func committedBlockBarrier(t *testing.T, full bool) {
 	origin := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "public,max-age=3600")
 		w.Header().Set("ETag", `"one"`)
-		if r.Header.Get("Range") == "bytes=1048576-2097151" {
+		out := &originBoundaryWriter{ResponseWriter: w, boundary: 1 << 20, cross: func() error {
 			close(blocked)
-			<-release
-		}
-		http.ServeContent(w, r, "body", time.Time{}, bytes.NewReader(data))
+			select {
+			case <-release:
+				return nil
+			case <-r.Context().Done():
+				return r.Context().Err()
+			}
+		}}
+		http.ServeContent(out, r, "body", time.Time{}, bytes.NewReader(data))
 	}
 	var s http.Handler
 	if full {
@@ -69,7 +124,7 @@ func committedBlockBarrier(t *testing.T, full bool) {
 	select {
 	case <-blocked:
 	case <-time.After(5 * time.Second):
-		t.Fatal("second block never requested")
+		t.Fatal("second block bytes never reached origin gate")
 	}
 	select {
 	case err := <-first:
@@ -179,15 +234,24 @@ func TestPublicGETAndOverlappingRangeShareBlockProducers(t *testing.T) {
 			mu.Lock()
 			counts[r.Header.Get("Range")]++
 			mu.Unlock()
-			if r.Header.Get("Range") == "bytes=1048576-2097151" {
-				close(entered)
-				<-release
-			}
+
 			if r.Header.Get("User-Agent") != "Razor" || r.Header.Get("X-Real-IP") != "" {
 				t.Error("detached block lost canonical identity")
 			}
 		}
-		http.ServeContent(w, r, "body", time.Time{}, bytes.NewReader(data))
+		out := &originBoundaryWriter{ResponseWriter: w, boundary: 1 << 20, cross: func() error {
+			if start, _, ok := originInterval(r); ok && start > 1<<20 {
+				return nil
+			}
+			close(entered)
+			select {
+			case <-release:
+				return nil
+			case <-r.Context().Done():
+				return r.Context().Err()
+			}
+		}}
+		http.ServeContent(out, r, "body", time.Time{}, bytes.NewReader(data))
 	}))
 	defer origin.Close()
 	cfg := config.GetDefaultConfig()
@@ -226,7 +290,7 @@ func TestPublicGETAndOverlappingRangeShareBlockProducers(t *testing.T) {
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("second block not requested")
+		t.Fatal("second block bytes did not reach origin gate")
 	}
 	go request("bytes=1048576-3145727", "range-client", part)
 	waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillWaiters >= 2 && st.SharedFillJoined > 0 })
@@ -243,12 +307,12 @@ func TestPublicGETAndOverlappingRangeShareBlockProducers(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if heads.Load() != 1 || len(counts) != 3 {
+	if heads.Load() != 1 || len(counts) != 2 {
 		t.Fatalf("HEAD=%d blocks=%v", heads.Load(), counts)
 	}
-	for value, n := range counts {
-		if n != 1 {
-			t.Errorf("block %s producers=%d", value, n)
+	for _, value := range []string{"bytes=0-2097151", "bytes=2097152-3145727"} {
+		if counts[value] != 1 {
+			t.Errorf("aligned run %s producers=%d", value, counts[value])
 		}
 	}
 	waitFillStats(t, s, func(st server.Stats) bool {
@@ -368,28 +432,27 @@ func TestCommittedBlockStreamAbortsOnLaterOriginFailure(t *testing.T) {
 	for _, full := range []bool{false, true} {
 		for _, failure := range []string{"truncated", "etag", "200"} {
 			t.Run(fmt.Sprintf("full=%t/%s", full, failure), func(t *testing.T) {
-				data := bytes.Repeat([]byte("v"), 2<<20)
+				data := bytes.Repeat([]byte("v"), 3<<20)
 				origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					w.Header().Set("ETag", `"one"`)
 					w.Header().Set("Cache-Control", "public,max-age=3600")
-					if r.Header.Get("Range") == "bytes=1048576-2097151" {
+					if start, _, ok := originInterval(r); ok && start == 2<<20 {
 						switch failure {
-						case "truncated":
-							w.Header().Set("Content-Range", "bytes 1048576-2097151/2097152")
-							w.Header().Set("Content-Length", "1048576")
-							w.WriteHeader(206)
-							w.Write([]byte("cut"))
-							return
 						case "etag":
 							w.Header().Set("ETag", `"two"`)
 						case "200":
 							w.Header().Set("Content-Length", fmt.Sprint(len(data)))
 							w.WriteHeader(200)
-							w.Write(data)
+							_, _ = w.Write(data)
 							return
 						}
 					}
-					http.ServeContent(w, r, "body", time.Time{}, bytes.NewReader(data))
+					var out http.ResponseWriter = w
+					if failure == "truncated" {
+						out = &originBoundaryWriter{ResponseWriter: w, boundary: (1 << 20) + 3, cross: func() error { return io.ErrUnexpectedEOF }}
+					}
+
+					http.ServeContent(out, r, "body", time.Time{}, bytes.NewReader(data))
 				}))
 				defer origin.Close()
 				cfg := config.GetDefaultConfig()
@@ -401,7 +464,7 @@ func TestCommittedBlockStreamAbortsOnLaterOriginFailure(t *testing.T) {
 				req.Host = "cache.test"
 				req.Header.Set("Accept-Encoding", "identity")
 				if !full {
-					req.Header.Set("Range", "bytes=0-2097151")
+					req.Header.Set("Range", "bytes=0-3145727")
 				}
 				resp, err := endpoint.Client().Do(req)
 				if err != nil {
@@ -413,7 +476,11 @@ func TestCommittedBlockStreamAbortsOnLaterOriginFailure(t *testing.T) {
 				if full {
 					wantStatus = 200
 				}
-				if resp.StatusCode != wantStatus || err == nil || !bytes.Equal(body, data[:1<<20]) {
+				minBytes, maxBytes := 2<<20, 2<<20
+				if failure == "truncated" {
+					minBytes, maxBytes = 1<<20, (1<<20)+3
+				}
+				if resp.StatusCode != wantStatus || err == nil || len(body) < minBytes || len(body) > maxBytes || !bytes.Equal(body, data[:len(body)]) {
 					t.Fatalf("late failure status=%d bytes=%d err=%v", resp.StatusCode, len(body), err)
 				}
 				waitFillStats(t, s, func(st server.Stats) bool {
@@ -431,16 +498,16 @@ func TestCommittedBlockClientCancellationStopsPrefetch(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", `"prefetch"`)
 		w.Header().Set("Cache-Control", "public,max-age=3600")
-		if r.Header.Get("Range") == "bytes=1048576-2097151" {
+		if start, end, ok := originInterval(r); ok && (start >= 2<<20 || end >= 2<<20) {
+			third.Add(1)
+		}
+		out := &originBoundaryWriter{ResponseWriter: w, boundary: 1 << 20, cross: func() error {
 			close(entered)
 			<-r.Context().Done()
 			close(cancelled)
-			return
-		}
-		if r.Header.Get("Range") == "bytes=2097152-3145727" {
-			third.Add(1)
-		}
-		http.ServeContent(w, r, "body", time.Time{}, bytes.NewReader(data))
+			return r.Context().Err()
+		}}
+		http.ServeContent(out, r, "body", time.Time{}, bytes.NewReader(data))
 	}))
 	defer origin.Close()
 	cfg := config.GetDefaultConfig()
@@ -461,16 +528,16 @@ func TestCommittedBlockClientCancellationStopsPrefetch(t *testing.T) {
 	select {
 	case <-entered:
 	case <-time.After(3 * time.Second):
-		t.Fatal("no one-block prefetch")
+		t.Fatal("second chunk never reached source gate")
 	}
 	resp.Body.Close()
 	select {
 	case <-cancelled:
 	case <-time.After(3 * time.Second):
-		t.Fatal("cancelled client retained prefetch")
+		t.Fatal("cancelled client retained merged fill")
 	}
 	if third.Load() != 0 {
-		t.Fatalf("prefetched outside requested interval: %d", third.Load())
+		t.Fatalf("fetched outside requested interval: %d", third.Load())
 	}
 	waitFillStats(t, s, func(st server.Stats) bool {
 		return st.SharedFillTasks == 0 && st.SharedFillWaiters == 0 && st.RangeReaders == 0 && st.BufferReserved == 0 && st.Origin.InFlight == 0
