@@ -119,6 +119,16 @@ func (od *OpenDir) Acquire(key []byte) *OpenDirEntry {
 
 // Release cannot drop a replacement entry after an invalidation.
 func (od *OpenDir) Release(key []byte, expected *OpenDirEntry) {
+	od.release(key, expected, false)
+}
+
+// A terminal writer no longer owns the key. Existing readers retain their
+// exact entry and writer independently of the active-writer directory.
+func (od *OpenDir) releaseWriter(key []byte, expected *OpenDirEntry) {
+	od.release(key, expected, true)
+}
+
+func (od *OpenDir) release(key []byte, expected *OpenDirEntry, writerDone bool) {
 	if expected == nil {
 		return
 	}
@@ -128,7 +138,7 @@ func (od *OpenDir) Release(key []byte, expected *OpenDirEntry) {
 	expected.RefCount--
 	remove := expected.RefCount <= 0
 	expected.mutex.Unlock()
-	if remove && od.entries[string(key)] == expected {
+	if (writerDone || remove) && od.entries[string(key)] == expected {
 		delete(od.entries, string(key))
 	}
 }

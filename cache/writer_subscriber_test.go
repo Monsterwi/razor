@@ -60,6 +60,39 @@ func TestWriterSubscribersHaveIndependentProgressAndCancellation(t *testing.T) {
 	}
 }
 
+func TestCommittedWriterIsCacheHitWhileStreamingSubscriberStillOpen(t *testing.T) {
+	c := safetyCache(t)
+	key := []byte("committed-with-subscriber")
+	w, err := c.OpenWrite(key, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscriber, err := w.OpenReader(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subscriber.Close()
+	if _, err := w.Write([]byte("complete bytes")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	hit, err := c.OpenReadCommitted(key)
+	if err != nil {
+		t.Fatalf("retained subscriber hid committed object: %v", err)
+	}
+	defer hit.Close()
+	body, err := io.ReadAll(hit)
+	if err != nil || string(body) != "complete bytes" {
+		t.Fatalf("committed hit=%q err=%v", body, err)
+	}
+	body, err = io.ReadAll(subscriber)
+	if err != nil || string(body) != "complete bytes" {
+		t.Fatalf("original subscriber=%q err=%v", body, err)
+	}
+}
+
 func TestLateWriterSubscriptionCannotJoinOrReleaseReplacement(t *testing.T) {
 	c := safetyCache(t)
 	key := []byte("replaced-writer")
