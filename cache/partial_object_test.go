@@ -245,6 +245,10 @@ func BenchmarkPartialCoverage(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
+			object, err := m.MarshalBinary()
+			if err != nil {
+				b.Fatal(err)
+			}
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
@@ -258,6 +262,7 @@ func BenchmarkPartialCoverage(b *testing.B) {
 				}
 			}
 			b.ReportMetric(float64(len(data)), "segment-B")
+			b.ReportMetric(float64(len(object)), "object-B")
 			b.ReportMetric(float64(DocHeaderSize+len(header)+len(data)), "record-B")
 			directory := c.Stripes[0].DirMgr
 			entries := directory.DirTrie.Snapshot()
