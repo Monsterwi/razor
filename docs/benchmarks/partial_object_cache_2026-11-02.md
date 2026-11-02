@@ -4,7 +4,7 @@
 
 本机正确性验收已完成：保守模式 20 项、Otter 与 S3-FIFO public 模式各 18 项、工具测试 32 项全部通过且没有 skip。完整 Go 与 race 结果及退出码见附件。专机 HDD/SSD 各 18 项功能与 69 组成本测量全部通过，合计 40,147 个校验响应、0 错误；本机 overlay 上的功能用例不作为性能结果。
 
-附件：[15 场景 / 34 Stories / 35 实施决策矩阵](partial_object_cache_2026-11-02-matrix.md) · [紧凑原值与命令 JSON](partial_object_cache_2026-11-02.json) · [138 组原值 CSV](partial_object_cache_2026-11-02.csv)。运行日志保存在任务归档 `46-final-*`；JSON 包含完整 Go 结果、工具汇总、逐场景结果及精确源站计数，审阅无需访问临时目录。
+附件：[15 场景 / 34 Stories / 35 实施决策矩阵](partial_object_cache_2026-11-02-matrix.md) · [紧凑原值与命令 JSON](partial_object_cache_2026-11-02.json) · [138 组原值 CSV](partial_object_cache_2026-11-02.csv)。本机最终日志为 `46-final-go-confirmed.log`、`46-final-race-confirmed.log`、`46-final-conservative-green.log`、`46-final-public-{otter,s3-fifo}.log` 和 `46-final-tools.log`，各有独立 `.exit.json`。`46-final-conservative.log` 是修正旧工具标签断言前保留的失败记录，不能当作最终成功；JSON 包含完整 Go 结果、工具汇总、逐场景结果及精确源站计数，审阅无需访问临时目录。
 
 ## 版本与复现
 
@@ -19,7 +19,7 @@
 | 专机 cache.test SHA256 | `3d9213a0cc3be323761836b3981c94dc9568c8bc32443dd95e1e948325da60ab` |
 | checked hey SHA256 | `b61a5fddd268a30e269f46f11485513243a9b408bddcb220587299288b4bac41` |
 
-以下命令从仓库根目录执行，`BIN` 为构建出的绝对二进制路径，`HEY` 为 `tools/build_hey.py` 产物，`OUT` 为全新输出目录。测试源码和生成的配置均随对应提交可复现。
+以下命令从仓库根目录执行，`BIN` 为构建出的绝对二进制路径，`HEY` 为 `tools/build_hey.py` 产物，`OUT` 为全新输出目录。测试源码和生成的配置均随对应提交可复现。公开 JSON 将私有工作路径替换为 `${WORK_ROOT}`、`${HDD_CACHE_ROOT}`、`${SSD_CACHE_ROOT}` 和 `${LOCAL_RUN_ROOT}`；它们分别表示专机工作区、两介质隔离缓存根目录和本机归档目录，原始证据未修改。
 
 ```sh
 go test ./... -count=1 -timeout 180s
@@ -65,7 +65,7 @@ Range 跨两个 run 的旧流在源站仍提供原版本时继续；原 If-Match
 
 以下为三轮指标中位数；RSS 是各组三轮的最大采样值。TTFB 单位 ms，小 Range 都从 offset 123 开始。源站 GET/HEAD 和 bytes 为每轮的实际增量。
 
-| 介质 | Range | 冷/热 | GET / HEAD | 源 bytes / 客户端 bytes | 逻辑 byte hit | TTFB P50 / P99 ms | QPS |
+| 介质 | Range | 冷/热 | GET / HEAD | 源/客户端正文比（倍） | 逻辑 byte hit | TTFB P50 / P99 ms | QPS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | HDD | 1 B | 冷 | 1 / 1 | 1,048,576 | 0% | 11.458 / 11.458 | 78.3 |
 | HDD | 1 B | 热 | 0 / 0 | 0 | 100% | 1.284 / 2.587 | 680.1 |

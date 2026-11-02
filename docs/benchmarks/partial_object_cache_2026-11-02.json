@@ -14,7 +14,7 @@
     "gomaxprocs": 8,
     "filesystem": "overlay",
     "purpose": "correctness only; performance measured separately on dedicated machine",
-    "raw_artifact_root": "/tmp/plan-a-delivery.94FhAw",
+    "raw_artifact_root": "${LOCAL_RUN_ROOT}",
     "executions": [
       {
         "command": [
@@ -52,9 +52,9 @@
           "python3",
           "tools/acceptance.py",
           "--binary",
-          "/tmp/plan-a-delivery.94FhAw/razor-46-final",
+          "${LOCAL_RUN_ROOT}/razor-46-final",
           "--output",
-          "/tmp/plan-a-delivery.94FhAw/46-final-conservative-green",
+          "${LOCAL_RUN_ROOT}/46-final-conservative-green",
           "--products",
           "razor",
           "--mode",
@@ -73,9 +73,9 @@
           "python3",
           "tools/acceptance.py",
           "--binary",
-          "/tmp/plan-a-delivery.94FhAw/razor-46-final",
+          "${LOCAL_RUN_ROOT}/razor-46-final",
           "--output",
-          "/tmp/plan-a-delivery.94FhAw/46-final-public-otter",
+          "${LOCAL_RUN_ROOT}/46-final-public-otter",
           "--products",
           "razor",
           "--public-static",
@@ -97,9 +97,9 @@
           "python3",
           "tools/acceptance.py",
           "--binary",
-          "/tmp/plan-a-delivery.94FhAw/razor-46-final",
+          "${LOCAL_RUN_ROOT}/razor-46-final",
           "--output",
-          "/tmp/plan-a-delivery.94FhAw/46-final-public-s3-fifo",
+          "${LOCAL_RUN_ROOT}/46-final-public-s3-fifo",
           "--products",
           "razor",
           "--public-static",
@@ -1286,7 +1286,7 @@
           },
           "proxy.config.log.logfile_dir": {
             "type": "STRING",
-            "value": "/data/bakemono-lab/results/plan-a46-20261102T150920Z/hdd-benchmark/public-benchmark"
+            "value": "${WORK_ROOT}/results/plan-a46-20261102T150920Z/hdd-benchmark/public-benchmark"
           },
           "proxy.config.http.parent_proxy.upstream_algo": {
             "type": "STRING",
@@ -1469,7 +1469,7 @@
           },
           "proxy.config.log.logfile_dir": {
             "type": "STRING",
-            "value": "/data/bakemono-lab/results/plan-a46-20261102T150920Z/ssd-benchmark/public-benchmark"
+            "value": "${WORK_ROOT}/results/plan-a46-20261102T150920Z/ssd-benchmark/public-benchmark"
           },
           "proxy.config.http.parent_proxy.upstream_algo": {
             "type": "STRING",
@@ -7750,12 +7750,12 @@
       {
         "label": "hdd-public-functional",
         "command": [
-          "/data/bakemono-lab/opt/python-3.12.13/bin/python3",
+          "${WORK_ROOT}/opt/python-3.12.13/bin/python3",
           "tools/acceptance.py",
           "--binary",
-          "/data/bakemono-lab/build/plan-a46-20261102T150920Z/razor-static",
+          "${WORK_ROOT}/build/plan-a46-20261102T150920Z/razor-static",
           "--output",
-          "/data/bakemono-lab/results/plan-a46-20261102T150920Z/hdd-public-functional",
+          "${WORK_ROOT}/results/plan-a46-20261102T150920Z/hdd-public-functional",
           "--products",
           "razor",
           "--public-static",
@@ -7772,9 +7772,9 @@
           "--ram-algorithm",
           "otter",
           "--cache-root",
-          "/data3/bakemono-lab/cache/razor/plan-a46-20261102T150920Z/hdd-public-functional"
+          "${HDD_CACHE_ROOT}/plan-a46-20261102T150920Z/hdd-public-functional"
         ],
-        "cwd": "/data/bakemono-lab/build/plan-a46-20261102T150920Z/source",
+        "cwd": "${WORK_ROOT}/build/plan-a46-20261102T150920Z/source",
         "exit_code": 0,
         "start_utc": "2026-11-02T15:13:17.598274+00:00",
         "duration_seconds": 23.556761503219604
@@ -7782,12 +7782,12 @@
       {
         "label": "hdd-benchmark",
         "command": [
-          "/data/bakemono-lab/opt/python-3.12.13/bin/python3",
+          "${WORK_ROOT}/opt/python-3.12.13/bin/python3",
           "tools/acceptance.py",
           "--binary",
-          "/data/bakemono-lab/build/plan-a46-20261102T150920Z/razor-static",
+          "${WORK_ROOT}/build/plan-a46-20261102T150920Z/razor-static",
           "--output",
-          "/data/bakemono-lab/results/plan-a46-20261102T150920Z/hdd-benchmark",
+          "${WORK_ROOT}/results/plan-a46-20261102T150920Z/hdd-benchmark",
           "--products",
           "razor",
           "--public-static",
@@ -7804,9 +7804,9 @@
           "--ram-algorithm",
           "otter",
           "--cache-root",
-          "/data3/bakemono-lab/cache/razor/plan-a46-20261102T150920Z/hdd-benchmark"
+          "${HDD_CACHE_ROOT}/plan-a46-20261102T150920Z/hdd-benchmark"
         ],
-        "cwd": "/data/bakemono-lab/build/plan-a46-20261102T150920Z/source",
+        "cwd": "${WORK_ROOT}/build/plan-a46-20261102T150920Z/source",
         "exit_code": 0,
         "start_utc": "2026-11-02T15:13:41.155923+00:00",
         "duration_seconds": 93.5545699596405
@@ -7814,12 +7814,12 @@
       {
         "label": "ssd-public-functional",
         "command": [
-          "/data/bakemono-lab/opt/python-3.12.13/bin/python3",
+          "${WORK_ROOT}/opt/python-3.12.13/bin/python3",
           "tools/acceptance.py",
           "--binary",
-          "/data/bakemono-lab/build/plan-a46-20261102T150920Z/razor-static",
+          "${WORK_ROOT}/build/plan-a46-20261102T150920Z/razor-static",
           "--output",
-          "/data/bakemono-lab/results/plan-a46-20261102T150920Z/ssd-public-functional",
+          "${WORK_ROOT}/results/plan-a46-20261102T150920Z/ssd-public-functional",
           "--products",
           "razor",
           "--public-static",
@@ -7836,9 +7836,9 @@
           "--ram-algorithm",
           "otter",
           "--cache-root",
-          "/ssd1/bakemono-lab/cache/razor/plan-a46-20261102T150920Z/ssd-public-functional"
+          "${SSD_CACHE_ROOT}/plan-a46-20261102T150920Z/ssd-public-functional"
         ],
-        "cwd": "/data/bakemono-lab/build/plan-a46-20261102T150920Z/source",
+        "cwd": "${WORK_ROOT}/build/plan-a46-20261102T150920Z/source",
         "exit_code": 0,
         "start_utc": "2026-11-02T15:15:20.726882+00:00",
         "duration_seconds": 23.913063526153564
@@ -7846,12 +7846,12 @@
       {
         "label": "ssd-benchmark",
         "command": [
-          "/data/bakemono-lab/opt/python-3.12.13/bin/python3",
+          "${WORK_ROOT}/opt/python-3.12.13/bin/python3",
           "tools/acceptance.py",
           "--binary",
-          "/data/bakemono-lab/build/plan-a46-20261102T150920Z/razor-static",
+          "${WORK_ROOT}/build/plan-a46-20261102T150920Z/razor-static",
           "--output",
-          "/data/bakemono-lab/results/plan-a46-20261102T150920Z/ssd-benchmark",
+          "${WORK_ROOT}/results/plan-a46-20261102T150920Z/ssd-benchmark",
           "--products",
           "razor",
           "--public-static",
@@ -7868,9 +7868,9 @@
           "--ram-algorithm",
           "otter",
           "--cache-root",
-          "/ssd1/bakemono-lab/cache/razor/plan-a46-20261102T150920Z/ssd-benchmark"
+          "${SSD_CACHE_ROOT}/plan-a46-20261102T150920Z/ssd-benchmark"
         ],
-        "cwd": "/data/bakemono-lab/build/plan-a46-20261102T150920Z/source",
+        "cwd": "${WORK_ROOT}/build/plan-a46-20261102T150920Z/source",
         "exit_code": 0,
         "start_utc": "2026-11-02T15:15:44.640970+00:00",
         "duration_seconds": 93.4158935546875
@@ -7894,7 +7894,7 @@
       "execution": {
         "label": "hdd-metadata-benchmark",
         "command": [
-          "/data/bakemono-lab/build/plan-a46-20261102T150920Z/cache.test-static",
+          "${WORK_ROOT}/build/plan-a46-20261102T150920Z/cache.test-static",
           "-test.run",
           "^$",
           "-test.bench",
@@ -7906,7 +7906,7 @@
           "1s"
         ],
         "environment": {
-          "TMPDIR": "/data3/bakemono-lab/cache/razor/plan-a46-20261102T150920Z/metadata-tmp",
+          "TMPDIR": "${HDD_CACHE_ROOT}/plan-a46-20261102T150920Z/metadata-tmp",
           "GOMAXPROCS": "8"
         },
         "exit_code": 0,
@@ -8017,7 +8017,7 @@
       "execution": {
         "label": "ssd-metadata-benchmark",
         "command": [
-          "/data/bakemono-lab/build/plan-a46-20261102T150920Z/cache.test-static",
+          "${WORK_ROOT}/build/plan-a46-20261102T150920Z/cache.test-static",
           "-test.run",
           "^$",
           "-test.bench",
@@ -8029,7 +8029,7 @@
           "1s"
         ],
         "environment": {
-          "TMPDIR": "/ssd1/bakemono-lab/cache/razor/plan-a46-20261102T150920Z/metadata-tmp",
+          "TMPDIR": "${SSD_CACHE_ROOT}/plan-a46-20261102T150920Z/metadata-tmp",
           "GOMAXPROCS": "8"
         },
         "exit_code": 0,
@@ -8147,5 +8147,12 @@
       "observation": "origin calls 2; another build at same SHA passed; separate follow-up diagnosis underway"
     },
     "full_branch_review": "pending parent delivery workflow"
+  },
+  "path_redaction": {
+    "note": "Public command/config paths use placeholders; original raw evidence is unchanged.",
+    "WORK_ROOT": "dedicated machine isolated workspace",
+    "HDD_CACHE_ROOT": "isolated test cache root on verified HDD",
+    "SSD_CACHE_ROOT": "isolated test cache root on verified SSD",
+    "LOCAL_RUN_ROOT": "local development correctness artifact root"
   }
 }
