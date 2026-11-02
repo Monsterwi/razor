@@ -189,7 +189,9 @@ def correctness(client, product, origin, args):
         import http.client
         gate, entered = threading.Event(), threading.Event()
         path = "/large-rww"
-        if product.kind == "razor" or args.variant == "ats-slice":
+        if product.kind == "razor":
+            origin.rules[path] = {"body_gate_at": MIB, "gate": gate, "entered": entered}
+        elif args.variant == "ats-slice":
             origin.rules[path] = {"block_start": MIB, "gate": gate, "entered": entered}
         else:
             origin.rules[path] = {"chunk_delay": .002}
@@ -228,7 +230,9 @@ def correctness(client, product, origin, args):
     def truncated():
         path = "/large-truncated"
         rule = {"truncate": True}
-        if product.kind == "razor" or args.variant == "ats-slice":
+        if product.kind == "razor":
+            rule = {"truncate_at": MIB + (64 << 10)}
+        elif args.variant == "ats-slice":
             rule["block_start"] = MIB
         origin.rules[path] = rule
         row = client.request(product, path, expected=client.expected(path), case="truncated")

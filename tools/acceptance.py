@@ -147,15 +147,16 @@ class Origin:
                         else:
                             start, end = int(left), min(total - 1, int(right) if right else total - 1)
                         status = 206 if 0 <= start <= end < total else 416
-                # Faults/barriers affect only the selected GET block, never HEAD.
+                # Request-level rules match the selected GET start, never HEAD.
                 if "block_start" in rule and (self.command != "GET" or start != rule["block_start"]):
                     rule = {}
                 if rule.get("force_status"):
                     status = rule["force_status"]
-                if rule.get("entered"):
-                    rule["entered"].set()
-                if rule.get("gate"):
-                    rule["gate"].wait(15)
+                if "body_gate_at" not in rule:
+                    if rule.get("entered"):
+                        rule["entered"].set()
+                    if rule.get("gate"):
+                        rule["gate"].wait(15)
                 time.sleep(rule.get("header_delay", 0))
                 length = end - start + 1 if status in (200, 206) else 0
                 try:
@@ -176,8 +177,26 @@ class Origin:
                     with fixture.open("rb") as f:
                         f.seek(start)
                         remaining = length
+                        gate_at = rule.get("body_gate_at")
+                        truncate_at = rule.get("truncate_at")
                         while remaining:
-                            block = f.read(min(CHUNK, remaining // 2 if rule.get("truncate") else remaining))
+                            position = end + 1 - remaining
+                            if position == truncate_at:
+                                self.close_connection = True
+                                return
+                            if position == gate_at:
+                                self.wfile.flush()
+                                if rule.get("entered"):
+                                    rule["entered"].set()
+                                if rule.get("gate"):
+                                    rule["gate"].wait(15)
+                                gate_at = None
+                            count = min(CHUNK, remaining // 2 if rule.get("truncate") else remaining)
+                            if gate_at is not None and position < gate_at:
+                                count = min(count, gate_at - position)
+                            if truncate_at is not None and position < truncate_at:
+                                count = min(count, truncate_at - position)
+                            block = f.read(count)
                             self.wfile.write(block)
                             with owner.lock:
                                 row["bytes"] += len(block)
@@ -580,14 +599,18 @@ def functional(args, fixtures, output):
             summary = client.batch(product, origin, f"different-overlapping-ranges-c{concurrency}",
                                    "/large-overlap-stress", concurrency, count=1, ranges=overlap)
             assert summary["origin"]["bytes"] == (40 * MIB if concurrency == 8 else 0), summary
-            assert summary["origin"]["get"] == (40 if concurrency == 8 else 0), summary
+            assert summary["origin"]["get"] == (20 if concurrency == 8 else 0), summary
+        actual_ranges = [row["range"] for row in origin.records
+                         if row["path"] == "/large-overlap-stress" and row["method"] == "GET"]
+        expected_ranges = [f"bytes={start}-{start + 2 * MIB - 1}" for start in range(0, 40 * MIB, 2 * MIB)]
+        assert sorted(actual_ranges) == sorted(expected_ranges), actual_ranges
         record("8/32 clients with four overlapping16MiB ranges:40MiB union fetched once")
         changed = "/large-version-swap"
         origin.rules[changed] = {"switch_after_get": 1}
-        bounds = (0, 2 * MIB - 1)
-        result = client.request(product, changed, headers={"Range": "bytes=0-2097151"}, expected=client.expected(changed, bounds=bounds), status=206)
+        bounds = (0, 3 * MIB - 1)
+        result = client.request(product, changed, headers={"Range": f"bytes=0-{bounds[1]}"}, expected=client.expected(changed, bounds=bounds), status=206)
         assert result["error"], result
-        client.checked(product, changed, headers={"Range": "bytes=0-2097151"}, expected=client.expected(changed, version=2, bounds=bounds), status=206)
+        client.checked(product, changed, headers={"Range": f"bytes=0-{bounds[1]}"}, expected=client.expected(changed, version=2, bounds=bounds), status=206)
         record("Range version changes mid-fill: controlled failure then exact new version")
         before = origin.snapshot()
         product.stop()

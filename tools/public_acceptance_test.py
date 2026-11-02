@@ -12,6 +12,41 @@ from acceptance import Client, Origin, create_fixtures, MIB
 
 
 class PublicToolsTest(unittest.TestCase):
+    def test_body_gate_uses_absolute_offset_inside_one_range_response(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            root = Path(directory)
+            fixtures = create_fixtures(root / "fixtures", 3 * MIB)
+            origin = Origin(fixtures, root / "origin.json")
+            cleanup.callback(origin.close)
+            entered, gate = threading.Event(), threading.Event()
+            cleanup.callback(gate.set)
+            path, offset = "/large-body-gate", MIB + 17
+            origin.rules[path] = {"body_gate_at": offset, "entered": entered, "gate": gate}
+            client = Client(fixtures, root)
+            cleanup.callback(client.raw.close)
+            product = SimpleNamespace(kind="origin", port=origin.server.server_port)
+            client.checked(product, path, method="HEAD", expected=None)
+            for bounds in ((0, 16), (2 * MIB, 2 * MIB + 16)):
+                client.checked(product, path, headers={"Range": f"bytes={bounds[0]}-{bounds[1]}"},
+                               status=206, expected=client.expected(path, bounds=bounds))
+            self.assertFalse(entered.is_set(), "HEAD or a different range reached the body gate")
+            before = origin.snapshot(path)
+            connection = http.client.HTTPConnection("127.0.0.1", product.port, timeout=3)
+            cleanup.callback(connection.close)
+            start, end = MIB // 2, 2 * MIB - 1
+            connection.request("GET", path, headers={"Range": f"bytes={start}-{end}"})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 206)
+            self.assertEqual(response.getheader("Content-Range"), f"bytes {start}-{end}/{3 * MIB}")
+            self.assertEqual(int(response.getheader("Content-Length")), end - start + 1)
+            prefix = response.read(offset - start)
+            self.assertTrue(entered.wait(1))
+            self.assertFalse(gate.is_set())
+            self.assertEqual(origin.snapshot(path)["bytes"] - before["bytes"], offset - start)
+            self.assertEqual(prefix, fixtures[("large", 1)].read_bytes()[start:offset])
+            gate.set()
+            self.assertEqual(prefix + response.read(), fixtures[("large", 1)].read_bytes()[start:end + 1])
+
     def test_block_fault_is_scoped_and_source_address_is_real(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             root = Path(directory)
@@ -28,6 +63,33 @@ class PublicToolsTest(unittest.TestCase):
                 self.assertFalse(row["error"], row)
             self.assertEqual({r["remote_ip"] for r in origin.records}, {"127.0.0.42"})
             self.assertEqual([r["status"] for r in origin.records], [206, 200])
+
+    def test_body_truncation_preserves_exact_prefix_at_absolute_offset(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            root = Path(directory)
+            fixtures = create_fixtures(root / "fixtures", 3 * MIB)
+            origin = Origin(fixtures, root / "origin.json")
+            cleanup.callback(origin.close)
+            path, offset = "/large-body-truncate", MIB + 31
+            origin.rules[path] = {"truncate_at": offset}
+            data = fixtures[("large", 1)].read_bytes()
+            for start, end in ((0, 16), (MIB // 2, 2 * MIB - 1), (2 * MIB, 2 * MIB + 16)):
+                with self.subTest(start=start, end=end):
+                    connection = http.client.HTTPConnection("127.0.0.1", origin.server.server_port, timeout=3)
+                    try:
+                        connection.request("GET", path, headers={"Range": f"bytes={start}-{end}"})
+                        response = connection.getresponse()
+                        self.assertEqual(response.status, 206)
+                        self.assertEqual(response.getheader("Content-Range"), f"bytes {start}-{end}/{3 * MIB}")
+                        self.assertEqual(int(response.getheader("Content-Length")), end - start + 1)
+                        if start <= offset <= end:
+                            with self.assertRaises(http.client.IncompleteRead) as caught:
+                                response.read()
+                            self.assertEqual(caught.exception.partial, data[start:offset])
+                        else:
+                            self.assertEqual(response.read(), data[start:end + 1])
+                    finally:
+                        connection.close()
 
     def test_truncated_origin_block_is_short_on_real_http_at_every_layout(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
