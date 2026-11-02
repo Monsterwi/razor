@@ -12,6 +12,44 @@ from acceptance import Client, Origin, create_fixtures, MIB
 
 
 class PublicToolsTest(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("RAZOR_ACCEPTANCE_BINARY"), "set RAZOR_ACCEPTANCE_BINARY for real binary smoke")
+    def test_real_binary_purge_keeps_started_stream_and_fences_late_publication(self):
+        from acceptance import Product
+        from public_acceptance import purge_active_response
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            root = Path(directory)
+            fixtures = create_fixtures(root / "fixtures", 3 * MIB + 37)
+            origin = Origin(fixtures, root / "origin.json")
+            cleanup.callback(origin.close)
+            client = Client(fixtures, root)
+            cleanup.callback(client.raw.close)
+            args = SimpleNamespace(binary=Path(os.environ["RAZOR_ACCEPTANCE_BINARY"]), cache_root=None,
+                public_static=True, ram_algorithm="otter", ram_bytes=10 * MIB, block_bytes=MIB)
+            product = Product("razor", root / "purge", origin, args, capacity=64)
+            cleanup.callback(product.stop)
+            for prefix in (False, True):
+                for full in (False, True):
+                    with self.subTest(prefix=prefix, full=full):
+                        purge_active_response(product, origin, client, full=full, prefix=prefix)
+            with self.subTest(old_version="unavailable"):
+                purge_active_response(product, origin, client, retain_old=False)
+
+    def test_origin_retains_old_version_only_for_matching_if_match(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            root = Path(directory)
+            fixtures = create_fixtures(root / "fixtures", 3 * MIB)
+            origin = Origin(fixtures, root / "origin.json")
+            cleanup.callback(origin.close)
+            client = Client(fixtures, root)
+            cleanup.callback(client.raw.close)
+            product = SimpleNamespace(kind="origin", port=origin.server.server_port)
+            path = "/large-retained"
+            origin.rules[path] = {"version": 2, "retain_old_version": True}
+            client.checked(product, path, expected=client.expected(path, version=2))
+            client.checked(product, path, headers={"Range": "bytes=17-23", "If-Match": '"large-v1"'},
+                           status=206, expected=client.expected(path, bounds=(17, 23)))
+            client.checked(product, path, headers={"Range": "bytes=17-23", "If-Match": '"unknown"'}, status=412, expected=None)
+
     def test_body_gate_uses_absolute_offset_inside_one_range_response(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             root = Path(directory)

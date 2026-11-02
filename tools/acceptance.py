@@ -126,6 +126,8 @@ class Origin:
                     if rule.get("switch_after_get") and sum(r["method"] == "GET" and r["path"] == path for r in owner.records) > rule["switch_after_get"]:
                         rule["version"] = owner.rules[path]["version"] = 2
                 size = "large" if "large" in path else "small"
+                if rule.get("retain_old_version") and self.headers.get("If-Match") == f'"{size}-v1"':
+                    rule["version"] = 1
                 fixture = owner.fixtures[(size, rule.get("version", owner.version))]
                 total = fixture.stat().st_size
                 tag = '"%s-v%d"' % (size, rule.get("version", owner.version))
@@ -642,13 +644,12 @@ def functional(args, fixtures, output):
             follower.result()
         assert origin.snapshot(path)["get"] == 1
         record("creator cancellation leaves follower's" + large_label + " fill alive")
-        # Existing semantics preserve the old creator's private passthrough, but
-        # invalidate shared publication and reject old followers.
+        # Eligible fills purged before response headers fail without a version retry.
         path = "/small-purge-inflight"
         gate, entered = threading.Event(), threading.Event()
         origin.rules[path] = {"gate": gate, "entered": entered}
         with concurrent.futures.ThreadPoolExecutor() as pool:
-            old = pool.submit(client.checked, product, path)
+            old = pool.submit(client.request, product, path, expected=client.expected(path), status=None)
             assert entered.wait(5)
             follower = pool.submit(client.request, product, path, expected=client.expected(path))
             before_log = (product.dir / "process.log").stat().st_size
@@ -662,18 +663,15 @@ def functional(args, fixtures, output):
             origin.rules[path] = {"version": 2}
             client.checked(product, path, expected=client.expected(path, version=2))
             gate.set()
-            old.result()  # Exact original bytes, only to its original subscriber.
-            result = follower.result()
-            assert result["status"] == 503, result
+            for result in (old.result(), follower.result()):
+                assert result["status"] >= 500, result
         client.checked(product, path, expected=client.expected(path, version=2))
         assert origin.snapshot(path)["get"] == 2
-        access = [json.loads(line) for line in (product.dir / "access.log").read_text().splitlines()]
-        assert any(row.get("path") == path and row.get("cache_status") == "BYPASS" for row in access)
-        record("in-flight PURGE: old creator BYPASS; follower503; new version HIT unchanged", origin=origin.snapshot(path))
+        record("pre-header PURGE: old subscribers fail without retry; new version stays reusable", origin=origin.snapshot(path))
         path = "/large-truncated"
         origin.rules[path] = {"truncate": True}
         result = client.request(product, path, expected=client.expected(path))
-        assert result["status"] != 200, result
+        assert result["error"] and result["bytes"] < large_bytes, result
         origin.rules[path] = {}
         client.checked(product, path)
         assert origin.snapshot(path)["get"] == 2

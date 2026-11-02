@@ -93,6 +93,92 @@ def barrier_response(product, origin, client, path, full=False):
         c.close()
 
 
+def purge_active_response(product, origin, client, full=False, prefix=False, retain_old=True):
+    """Both generations have real client bytes before the old stream is released."""
+    path = "/large-purge-" + ("prefix" if prefix else "exact") + ("-get/item" if full else "-range/item")
+    if not retain_old:
+        assert not full
+        path += "-unavailable"
+    total = client.expected(path)[0]
+    start, end = (0, total - 1) if full else (17, 3 * MIB + 18)
+    gate_at = 128 << 10
+    entered, gate = threading.Event(), threading.Event()
+    new_entered, new_gate = threading.Event(), threading.Event()
+    origin.rules[path] = {"body_gate_at": gate_at, "entered": entered, "gate": gate}
+    old_conn = http.client.HTTPConnection("127.0.0.1", product.port, timeout=8)
+    new_conn = http.client.HTTPConnection("127.0.0.1", product.port, timeout=8)
+
+    def finish(response, first):
+        digest, length = hashlib.sha256(first), len(first)
+        while body := response.read(CHUNK):
+            digest.update(body)
+            length += len(body)
+        return length, digest.hexdigest()
+
+    try:
+        headers = {"Host": "bench.local", "Accept-Encoding": "identity"}
+        old_conn.request("GET", path, headers={**headers, **({} if full else {"Range": f"bytes={start}-{end}"})})
+        old = old_conn.getresponse()
+        assert old.status == (200 if full else 206), old.status
+        assert old.getheader("ETag") == '"large-v1"', old.getheaders()
+        assert old.getheader("Content-Length") == str(end - start + 1), old.getheaders()
+        assert old.getheader("Content-Range") == (None if full else f"bytes {start}-{end}/{total}"), old.getheaders()
+        first = old.read(gate_at - start - 1)
+        assert (len(first), hashlib.sha256(first).hexdigest()) == client.expected(path, bounds=(start, gate_at - 2))
+        assert entered.wait(5) and not gate.is_set(), "old origin must still be paused inside its first chunk"
+        assert origin.snapshot(path)["bytes"] == gate_at, origin.snapshot(path)
+        target = path.rsplit("/", 1)[0] + "/" if prefix else path
+        client.checked(product, target, method="PURGE", headers={"Authorization": "Bearer acceptance-local-token"}, expected=None)
+        origin.rules[path] = {"version": 2, "retain_old_version": retain_old, "body_gate_at": gate_at,
+                              "entered": new_entered, "gate": new_gate}
+        new_conn.request("GET", path, headers=headers)
+        new = new_conn.getresponse()
+        assert new.status == 200 and new.getheader("ETag") == '"large-v2"', new.getheaders()
+        assert new.getheader("Content-Length") == str(total) and new.getheader("Content-Range") is None, new.getheaders()
+        new_first = new.read(gate_at - 1)
+        assert (len(new_first), hashlib.sha256(new_first).hexdigest()) == client.expected(path, version=2, bounds=(0, gate_at - 2))
+        assert new_entered.wait(5) and not gate.is_set(), "new generation failed to start independently"
+        gate.set()
+        length, digest = finish(old, first)
+        if retain_old:
+            assert (length, digest) == client.expected(path, bounds=(start, end)), (length, old.getheaders())
+        else:
+            assert 0 < length < end - start + 1, length
+            assert (length, digest) == client.expected(path, bounds=(start, start + length - 1))
+        assert not new_gate.is_set(), "old subscription must leave while the new producer is active"
+        new_gate.set()
+        assert finish(new, new_first) == client.expected(path, version=2)
+        old_origin_bytes = total if full else min(total, 4 * MIB)
+        if not retain_old:
+            old_origin_bytes = 2 * MIB
+        expected_origin_bytes = total + old_origin_bytes
+        wait_for(lambda: origin.snapshot(path)["bytes"] == expected_origin_bytes, "both generations' exact origin bytes")
+        before = origin.snapshot(path)
+        assert before["get"] == (2 if full else 3), before
+        if not full:
+            old_ranges = [row for row in origin.records if row["path"] == path and row["method"] == "GET" and row["range"]]
+            assert [row["range"] for row in old_ranges] == [f"bytes=0-{2 * MIB - 1}", f"bytes={2 * MIB}-{min(total, 4 * MIB) - 1}"], old_ranges
+            assert all(row["headers"].get("If-Match") == '"large-v1"' for row in old_ranges), old_ranges
+        if not retain_old:
+            failed = [row for row in origin.records if row["path"] == path and row["status"] == 412]
+            assert len(failed) == 1 and failed[0]["headers"].get("If-Match") == '"large-v1"', failed
+        client.checked(product, path, expected=client.expected(path, version=2))
+        hot = client.checked(product, path, headers={"Range": "bytes=7-23"}, status=206,
+                             expected=client.expected(path, version=2, bounds=(7, 23)))
+        hot_headers = {name.lower(): value for name, value in hot["headers"].items()}
+        assert hot_headers["etag"] == '"large-v2"' and hot_headers["content-length"] == "17", hot
+        assert hot_headers["content-range"] == f"bytes 7-23/{total}", hot
+        assert origin.snapshot(path) == before, (before, origin.snapshot(path))
+        return {"old_status": old.status, "old_bytes": length, "old_sha256": digest,
+                "old_completed": retain_old, "client_prefix_before_purge": len(first),
+                "origin": before, "new_generation_still_hot": True}
+    finally:
+        gate.set()
+        new_gate.set()
+        old_conn.close()
+        new_conn.close()
+
+
 def public_functional(args, fixtures, output, smoke=False):
     evidence = []
     with ExitStack() as cleanup:
@@ -133,6 +219,13 @@ def public_functional(args, fixtures, output, smoke=False):
         for full in (False, True):
             details = barrier_response(product, origin, client, "/large-barrier-" + str(full), full)
             record(output, evidence, "real HTTP RWW prefix before blocked origin: " + ("GET" if full else "Range"), **details)
+        for prefix in (False, True):
+            for full in (False, True):
+                details = purge_active_response(product, origin, client, full=full, prefix=prefix)
+                record(output, evidence, ("prefix" if prefix else "exact") + " PURGE after client prefix: old " +
+                       ("GET" if full else "Range") + " completes and cannot republish over new generation", **details)
+        details = purge_active_response(product, origin, client, retain_old=False)
+        record(output, evidence, "PURGE with unavailable old version: old Range fails without retry and new GET completes", **details)
         for fault in ("truncate", "force_status"):
             path = "/large-body-error-" + fault
             origin.rules[path] = ({"truncate_at": block + CHUNK} if fault == "truncate"
