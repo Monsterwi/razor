@@ -59,7 +59,7 @@ def record(output, evidence, name, **details):
 def barrier_response(product, origin, client, path, full=False):
     block = product.args.block_bytes
     entered, gate = threading.Event(), threading.Event()
-    origin.rules[path] = {"block_start": block, "entered": entered, "gate": gate}
+    origin.rules[path] = {"body_gate_at": block, "entered": entered, "gate": gate}
     bounds = None if full else (0, 3 * block - 1)
     expected = client.expected(path, bounds=bounds)
     c = http.client.HTTPConnection("127.0.0.1", product.port, timeout=8)
@@ -71,8 +71,9 @@ def barrier_response(product, origin, client, path, full=False):
         response = c.getresponse()
         assert response.status == (200 if full else 206)
         prefix = response.read(block)
-        assert len(prefix) == block and entered.wait(5), "first committed block or next producer missing"
+        assert len(prefix) == block and entered.wait(5), "first committed chunk or body gate missing"
         assert not gate.is_set(), "barrier unexpectedly released"
+        assert origin.snapshot(path)["bytes"] == block, origin.snapshot(path)
         digest, length = hashlib.sha256(prefix), len(prefix)
         assert digest.hexdigest() == client.expected(path, bounds=(0, block - 1))[1]
         gate.set()
@@ -127,10 +128,15 @@ def public_functional(args, fixtures, output, smoke=False):
             record(output, evidence, "real HTTP committed first block before blocked second: " + ("GET" if full else "Range"), **details)
         for fault in ("truncate", "force_status"):
             path = "/large-body-error-" + fault
-            origin.rules[path] = {"block_start": block, fault: True if fault == "truncate" else 200}
+            origin.rules[path] = ({"truncate_at": block + CHUNK} if fault == "truncate"
+                                  else {"block_start": 2 * block, "force_status": 200})
             row = client.request(product, path, headers={"Range": f"bytes=0-{3 * block - 1}"}, status=206,
                                  expected=client.expected(path, bounds=(0, 3 * block - 1)), case="expected-injected-body-error")
-            assert row["status"] == 206 and row["error"] and block <= row["bytes"] < 3 * block, row
+            minimum = block if fault == "truncate" else 2 * block
+            assert row["status"] == 206 and row["error"] and minimum <= row["bytes"] < 3 * block, row
+            headers = {name.lower(): value for name, value in row["headers"].items()}
+            assert headers["content-length"] == str(3 * block), row
+            assert headers["content-range"] == f"bytes 0-{3 * block - 1}/{large}", row
             record(output, evidence, "later " + fault + " detected by real body reader", response=row)
         # Gate one block, wait for 100 real TCP clients to subscribe before release.
         drain(product)
@@ -185,10 +191,10 @@ def public_functional(args, fixtures, output, smoke=False):
                 gate.set()
             owner.result()
         record(output, evidence, "unknown headers do not join or create duplicate active producer")
-        # Last subscriber cancellation while the next producer is blocked.
+        # Last subscriber cancellation while the merged response is held inside its body.
         path = "/large-last-cancel"
         entered, gate = threading.Event(), threading.Event()
-        origin.rules[path] = {"block_start": block, "entered": entered, "gate": gate}
+        origin.rules[path] = {"body_gate_at": block, "entered": entered, "gate": gate}
         c = http.client.HTTPConnection("127.0.0.1", product.port, timeout=8)
         try:
             c.request("GET", path, headers={"Host": "bench.local", "Accept-Encoding": "identity", "Range": f"bytes=0-{3 * block - 1}"})
@@ -198,13 +204,15 @@ def public_functional(args, fixtures, output, smoke=False):
             c.sock.shutdown(socket.SHUT_RDWR)
             response.close()
             c.close()
+            final = drain(product)
+            held = origin.snapshot(path)
+            assert held["get"] == 1 and held["bytes"] == block, held
         finally:
             gate.set()
             c.close()
-        final = drain(product)
         assert final["stats"]["HeapAlloc"] > 0 and "GCCount" in final["stats"]
-        assert origin.snapshot(path)["get"] <= 2, origin.snapshot(path)
-        record(output, evidence, "reader cancellation bounds prefetch and drains", drain=final)
+        assert origin.snapshot(path)["get"] == 1, origin.snapshot(path)
+        record(output, evidence, "reader cancellation stops merged run and drains", drain=final, origin_before_release=held)
         # Clean restart reuses committed blocks; PURGE forces a new generation.
         path = "/large-union"
         before = origin.snapshot(path)
