@@ -460,6 +460,9 @@ func (s *Server) fetchRangeRun(task *fillTask, request *http.Request, root []byt
 				break
 			}
 		}
+		if readErr != nil && readErr != io.EOF {
+			return readErr
+		}
 		if remaining != 0 {
 			if readErr == io.EOF {
 				readErr = io.ErrUnexpectedEOF
