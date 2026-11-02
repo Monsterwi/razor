@@ -85,7 +85,16 @@ type partialSegment struct {
 
 // Coverage reads one bounded record; no map grows with the number of objects.
 func (c *Cache) PartialCoverage(root []byte, m *PartialObject, segment int64) (PartialCoverage, error) {
-	data, _, revision, err := c.readPartialRecord(m.segmentKey(root, segment))
+	key := m.segmentKey(root, segment)
+	lock := &c.partialLocks[crc32.ChecksumIEEE(key)%uint32(len(c.partialLocks))]
+	lock.Lock()
+	defer lock.Unlock()
+	return c.readPartialCoverage(key, m, segment)
+}
+
+// Hold the segment lock through the read so replacement cannot look like a miss.
+func (c *Cache) readPartialCoverage(key []byte, m *PartialObject, segment int64) (PartialCoverage, error) {
+	data, _, revision, err := c.readPartialRecord(key)
 	if err != nil {
 		return PartialCoverage{}, err
 	}
@@ -115,7 +124,7 @@ func (c *Cache) updatePartialCoverage(ctx context.Context, parent *FillToken, ro
 	lock := &c.partialLocks[crc32.ChecksumIEEE(key)%uint32(len(c.partialLocks))]
 	lock.Lock()
 	defer lock.Unlock()
-	coverage, _ := c.PartialCoverage(root, m, segment)
+	coverage, _ := c.readPartialCoverage(key, m, segment)
 	if observed != nil && coverage != *observed {
 		return nil
 	}
