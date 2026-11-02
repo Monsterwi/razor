@@ -307,13 +307,8 @@ func TestPublicGETAndOverlappingRangeShareBlockProducers(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if heads.Load() != 1 || len(counts) != 2 {
-		t.Fatalf("HEAD=%d blocks=%v", heads.Load(), counts)
-	}
-	for _, value := range []string{"bytes=0-2097151", "bytes=2097152-3145727"} {
-		if counts[value] != 1 {
-			t.Errorf("aligned run %s producers=%d", value, counts[value])
-		}
+	if heads.Load() != 0 || len(counts) != 1 || counts[""] != 1 {
+		t.Fatalf("cold GET/Range did not share one ordinary GET: HEAD=%d requests=%v", heads.Load(), counts)
 	}
 	waitFillStats(t, s, func(st server.Stats) bool {
 		return st.RangeReaders == 0 && st.SharedFillTasks == 0 && st.SharedFillWaiters == 0 && st.BufferReserved == 0
@@ -458,6 +453,12 @@ func TestCommittedBlockStreamAbortsOnLaterOriginFailure(t *testing.T) {
 				cfg := config.GetDefaultConfig()
 				cfg.SharedFillPublicStatic = 1
 				s := blockServer(t, cfg, filepath.Join(t.TempDir(), "cache"), 32<<20, origin.URL)
+				if full && failure != "truncated" {
+					warm := fetch(s, "http://cache.test/item", http.Header{"Accept-Encoding": {"identity"}, "Range": {"bytes=0-2097151"}})
+					if warm.Code != 206 || !bytes.Equal(warm.Body.Bytes(), data[:2<<20]) {
+						t.Fatalf("warm prefix status=%d bytes=%d", warm.Code, warm.Body.Len())
+					}
+				}
 				endpoint := httptest.NewServer(s)
 				defer endpoint.Close()
 				req, _ := http.NewRequest("GET", endpoint.URL+"/item", nil)
@@ -544,7 +545,7 @@ func TestCommittedBlockClientCancellationStopsPrefetch(t *testing.T) {
 	})
 }
 
-func TestPublicSmallObjectKeepsWholePath(t *testing.T) {
+func TestPublicSmallObjectSharesPartialPath(t *testing.T) {
 	data := bytes.Repeat([]byte("s"), 256<<10)
 	var heads, whole, ranges atomic.Int32
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -570,7 +571,11 @@ func TestPublicSmallObjectKeepsWholePath(t *testing.T) {
 			t.Fatalf("small status=%d bytes=%d", got.Code, got.Body.Len())
 		}
 	}
-	if heads.Load() != 1 || whole.Load() != 1 || ranges.Load() != 0 {
+	part := fetch(s, "http://cache.test/small", http.Header{"Accept-Encoding": {"identity"}, "Range": {"bytes=17-99"}})
+	if part.Code != 206 || !bytes.Equal(part.Body.Bytes(), data[17:100]) {
+		t.Fatalf("small Range status=%d bytes=%d", part.Code, part.Body.Len())
+	}
+	if heads.Load() != 0 || whole.Load() != 1 || ranges.Load() != 0 {
 		t.Fatalf("small classification HEAD=%d whole=%d range=%d", heads.Load(), whole.Load(), ranges.Load())
 	}
 }
@@ -718,7 +723,10 @@ func TestUnknownHeadersCannotBypassManifestOwnership(t *testing.T) {
 					}
 					<-release
 				} else {
-					gets.Add(1)
+					if gets.Add(1) == 1 && full {
+						close(entered)
+						<-release
+					}
 				}
 				http.ServeContent(w, r, "body", time.Time{}, bytes.NewReader(data))
 			})
@@ -745,7 +753,11 @@ func TestUnknownHeadersCannotBypassManifestOwnership(t *testing.T) {
 			case <-time.After(2 * time.Second):
 				t.Fatalf("concurrent HEAD retained: HEAD=%d GET=%d", heads.Load(), gets.Load())
 			}
-			if heads.Load() != 1 || gets.Load() != 0 {
+			wantHeads, wantGets := int32(1), int32(0)
+			if full {
+				wantHeads, wantGets = 0, 1
+			}
+			if heads.Load() != wantHeads || gets.Load() != wantGets {
 				t.Fatalf("ownership conflict reached origin HEAD=%d GET=%d", heads.Load(), gets.Load())
 			}
 			once.Do(func() { close(release) })

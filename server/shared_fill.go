@@ -54,7 +54,11 @@ func (s *Server) fetchFill(task *fillTask, r *http.Request, key []byte, resource
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		requested := s.now()
-		resp, originHeaders, err := resources.proxy.ProxyWithOriginHeaders(originRequest)
+		origin, err := resources.proxy.SelectOrigin(originRequest)
+		if err != nil {
+			return fillResult{err: err}
+		}
+		resp, originHeaders, err := origin.ProxyWithOriginHeaders(originRequest)
 		if err != nil {
 			return fillResult{err: err}
 		}
@@ -87,6 +91,10 @@ func (s *Server) fetchFill(task *fillTask, r *http.Request, key []byte, resource
 			continue
 		}
 		_, cacheable := responsePolicy(info, s.now())
+		if cacheable && blockGETEligible(r) && strongRangeTag(originHeaders.Get("ETag")) && len(originHeaders.Values("ETag")) == 1 && resp.RawResponse.ContentLength >= 0 && identityEncoding(originHeaders) && len(resp.RawResponse.Trailer) == 0 && cacheSizeAllowed(resources.config.MaxCacheObjectBytes, key, info, resp.RawResponse.ContentLength) {
+			info.ResponseHeaders = resp.Header().Clone()
+			return fillResult{err: s.fillPartialGET(task, r, key, origin, resp.RawResponse, info, resources)}
+		}
 		fields, _ := varyFields(originHeaders)
 		representation := representationKey(key, r.Header, fields)
 		info.ResponseHeaders = resp.Header().Clone()

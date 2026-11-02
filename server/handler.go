@@ -40,6 +40,9 @@ func (s *Server) handleGet(key []byte, w http.ResponseWriter, r *http.Request) {
 		s.proxyWithoutCache(w, r)
 		return
 	}
+	if blockGETEligible(r) && s.serveKnownPartialGET(w, r, key) {
+		return
+	}
 	selected, selectedInfo, policy, lookupErr := s.lookupCached(key, r)
 	if lookupErr != nil {
 		s.proxyWithoutCache(w, r)
@@ -56,9 +59,6 @@ func (s *Server) handleGet(key []byte, w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodHead {
 		s.proxyWithoutCache(w, r)
-		return
-	}
-	if requestRuntime(r).config.SharedFillPublicStatic == 1 && blockGETEligible(r) && s.serveBlocks(w, r, key, true) {
 		return
 	}
 	// Capture the invalidation fence before origin work, never on a fresh HIT.

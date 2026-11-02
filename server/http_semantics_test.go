@@ -98,22 +98,22 @@ func TestRevalidationMerges304AndReplaces200(t *testing.T) {
 	})
 	server.WithClock(func() time.Time { return now })(s)
 	target := "http://cache.test/item"
-	first := fetch(s, target, nil)
+	first := fetchWhole(s, target, nil)
 	now = now.Add(11 * time.Second)
-	validated := fetch(s, target, http.Header{"If-None-Match": {`"different-client-version"`}})
+	validated := fetchWhole(s, target, http.Header{"If-None-Match": {`"different-client-version"`}})
 	if validated.Code != 200 || validated.Body.String() != first.Body.String() || validated.Header().Get("X-Validated") != "yes" || validated.Header().Get("Content-Length") != "5" {
 		t.Fatalf("validated=%d %v %q", validated.Code, validated.Header(), validated.Body.String())
 	}
-	hit := fetch(s, target, nil)
+	hit := fetchWhole(s, target, nil)
 	if hit.Body.String() != "body1" || calls.Load() != 2 {
 		t.Fatalf("after 304 body=%q calls=%d", hit.Body.String(), calls.Load())
 	}
 	version = 2
-	replacement := fetch(s, target, http.Header{"Cache-Control": {"no-cache"}, "If-None-Match": {`"v1"`}})
+	replacement := fetchWhole(s, target, http.Header{"Cache-Control": {"no-cache"}, "If-None-Match": {`"v1"`}})
 	if replacement.Code != 200 || replacement.Body.String() != "body2" {
 		t.Fatalf("replacement=%d %q", replacement.Code, replacement.Body.String())
 	}
-	if got := fetch(s, target, nil).Body.String(); got != "body2" || calls.Load() != 3 {
+	if got := fetchWhole(s, target, nil).Body.String(); got != "body2" || calls.Load() != 3 {
 		t.Fatalf("new hit=%q calls=%d", got, calls.Load())
 	}
 }
@@ -126,7 +126,7 @@ func TestConditionalGetAndHeadUseCompleteGetMetadata(t *testing.T) {
 		fmt.Fprint(w, "complete")
 	})
 	target := "http://cache.test/item"
-	fetch(s, target, nil)
+	fetchWhole(s, target, nil)
 	for _, method := range []string{"GET", "HEAD"} {
 		r := httptest.NewRequest(method, target, nil)
 		r.Header.Set("If-None-Match", `"different", W/"part,one"`)
@@ -141,18 +141,18 @@ func TestConditionalGetAndHeadUseCompleteGetMetadata(t *testing.T) {
 	if head.Code != 200 || head.Body.Len() != 0 || head.Header().Get("Content-Length") != "8" {
 		t.Fatalf("HEAD=%d %v %q", head.Code, head.Header(), head.Body.String())
 	}
-	precedence := fetch(s, target, http.Header{"If-None-Match": {`"different"`}, "If-Modified-Since": {"Tue, 20 Oct 2026 00:00:00 GMT"}})
+	precedence := fetchWhole(s, target, http.Header{"If-None-Match": {`"different"`}, "If-Modified-Since": {"Tue, 20 Oct 2026 00:00:00 GMT"}})
 	if precedence.Code != 200 || precedence.Body.String() != "complete" {
 		t.Fatal("If-Modified-Since overrode If-None-Match")
 	}
-	modified := fetch(s, target, http.Header{"If-Modified-Since": {"Tue, 20 Oct 2026 00:00:00 GMT"}})
+	modified := fetchWhole(s, target, http.Header{"If-Modified-Since": {"Tue, 20 Oct 2026 00:00:00 GMT"}})
 	if modified.Code != 304 || modified.Body.Len() != 0 {
 		t.Fatal("Last-Modified condition missed")
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("conditional origin calls=%d", calls.Load())
 	}
-	if got := fetch(s, target, nil).Body.String(); got != "complete" {
+	if got := fetchWhole(s, target, nil).Body.String(); got != "complete" {
 		t.Fatal("HEAD replaced GET body")
 	}
 }
@@ -287,14 +287,14 @@ func TestInFlightRevalidationCannotOverwritePurgeOrNewerResponse(t *testing.T) {
 				}
 			})
 			target := "http://cache.test/item"
-			fetch(s, target, nil)
+			fetchWhole(s, target, nil)
 			done := make(chan *httptest.ResponseRecorder, 1)
-			go func() { done <- fetch(s, target, http.Header{"Cache-Control": {"no-cache"}}) }()
+			go func() { done <- fetchWhole(s, target, http.Header{"Cache-Control": {"no-cache"}}) }()
 			<-entered
 			if invalidate {
 				purge(s, target, "test-secret")
 			}
-			if got := fetch(s, target, http.Header{"Cache-Control": {"no-cache"}, "X-Validation-Request": {"independent"}}).Body.String(); got != "new" {
+			if got := fetchWhole(s, target, http.Header{"Cache-Control": {"no-cache"}, "X-Validation-Request": {"independent"}}).Body.String(); got != "new" {
 				t.Fatal(got)
 			}
 			close(release)
@@ -302,7 +302,7 @@ func TestInFlightRevalidationCannotOverwritePurgeOrNewerResponse(t *testing.T) {
 				t.Fatalf("stale validation body=%q", got.Body.String())
 			}
 			before := calls.Load()
-			got := fetch(s, target, nil)
+			got := fetchWhole(s, target, nil)
 			if got.Body.String() != "new" || calls.Load() != before {
 				t.Fatalf("old validation damaged newer body: %q calls %d -> %d", got.Body.String(), before, calls.Load())
 			}
@@ -337,8 +337,8 @@ func TestUnsafe304MustRefetchWithoutReusingBody(t *testing.T) {
 				}
 			})
 			target := "http://cache.test/item"
-			fetch(s, target, nil)
-			got := fetch(s, target, http.Header{"Cache-Control": {"no-cache"}})
+			fetchWhole(s, target, nil)
+			got := fetchWhole(s, target, http.Header{"Cache-Control": {"no-cache"}})
 			if got.Body.String() != "new" || calls.Load() != 3 {
 				t.Fatalf("unsafe 304 reused %q calls=%d", got.Body.String(), calls.Load())
 			}
@@ -425,14 +425,14 @@ func TestOriginDelayContributesToAgeAndResponseNoCacheAlwaysValidates(t *testing
 	})
 	server.WithClock(now)(s)
 	target := "http://cache.test/item"
-	fetch(s, target, nil)
+	fetchWhole(s, target, nil)
 	nanos.Add(int64(2 * time.Second))
-	got := fetch(s, target, nil)
+	got := fetchWhole(s, target, nil)
 	if got.Header().Get("Age") != "12" || calls.Load() != 1 {
 		t.Fatalf("delay age=%q calls=%d", got.Header().Get("Age"), calls.Load())
 	}
 	nanos.Add(int64(time.Second))
-	fetch(s, target, nil)
+	fetchWhole(s, target, nil)
 	if calls.Load() != 2 {
 		t.Fatal("origin delay extended freshness")
 	}
@@ -448,7 +448,7 @@ func TestOriginDelayContributesToAgeAndResponseNoCacheAlwaysValidates(t *testing
 		fmt.Fprint(w, "validated body")
 	})
 	for range 3 {
-		if got := fetch(constrained, target, nil).Body.String(); got != "validated body" {
+		if got := fetchWhole(constrained, target, nil).Body.String(); got != "validated body" {
 			t.Fatal(got)
 		}
 	}
@@ -510,8 +510,8 @@ func TestUnconditionalRetryCannotReturnAnotherUnusable304(t *testing.T) {
 		w.WriteHeader(304)
 	})
 	target := "http://cache.test/item"
-	fetch(s, target, nil)
-	got := fetch(s, target, http.Header{"Cache-Control": {"no-cache"}})
+	fetchWhole(s, target, nil)
+	got := fetchWhole(s, target, http.Header{"Cache-Control": {"no-cache"}})
 	if got.Code != http.StatusBadGateway || calls.Load() != 3 {
 		t.Fatalf("unusable retry=%d calls=%d", got.Code, calls.Load())
 	}
@@ -769,4 +769,15 @@ func TestCachedPolicyAdvancesBetweenLookupAndResponse(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Keep complete-object validation coverage outside the identity-only partial path.
+func fetchWhole(s http.Handler, target string, headers http.Header) *httptest.ResponseRecorder {
+	if headers == nil {
+		headers = make(http.Header)
+	} else {
+		headers = headers.Clone()
+	}
+	headers.Set("Accept-Encoding", "gzip")
+	return fetch(s, target, headers)
 }

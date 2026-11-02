@@ -37,6 +37,20 @@ func (g *fillGroup) claimRange(identity, object string, first, last int64, token
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for _, task := range g.tasks {
+		if p := task.partial; p != nil && p.full && p.key == object && task.ctx.Err() == nil && g.cache.CheckFill(task.token) == nil {
+			p.mu.Lock()
+			current := p.index
+			p.mu.Unlock()
+			if first >= current && first <= (p.object.Total-1)/p.object.ChunkBytes {
+				if p.identity != identity {
+					return nil, false, errRangeOwnership
+				}
+				return g.attachLocked(task, cfg)
+			}
+			if current > first && current <= last {
+				last = current - 1
+			}
+		}
 		run := task.rangeRun
 		if run == nil || run.object != object || task.ctx.Err() != nil || g.cache.CheckFill(task.token) != nil {
 			continue
@@ -168,6 +182,9 @@ func (r *rangeChunkReader) close() {
 }
 
 func (c *rangeCursor) openChunk(index int64) (*rangeSubscription, error) {
+	if c.task != nil && c.task.partial != nil {
+		return c.subscribePartial(index)
+	}
 	if c.task != nil && index >= c.task.rangeRun.first && index <= c.task.rangeRun.last {
 		return c.subscribe(index)
 	}
@@ -250,6 +267,9 @@ func (c *rangeCursor) openChunk(index int64) (*rangeSubscription, error) {
 }
 
 func (c *rangeCursor) subscribe(index int64) (*rangeSubscription, error) {
+	if c.task.partial != nil {
+		return c.subscribePartial(index)
+	}
 	chunk := &c.task.rangeRun.chunks[index-c.task.rangeRun.first]
 	select {
 	case <-c.request.Context().Done():
@@ -285,7 +305,7 @@ func (c *rangeCursor) subscribe(index int64) (*rangeSubscription, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &rangeSubscription{body: bytes.NewReader(data), close: release, wait: wait, reused: true}, nil
+		return &rangeSubscription{body: bytes.NewReader(data), close: release, wait: wait}, nil
 	}
 	rt := requestRuntime(c.request)
 	release, err := rt.rangeReaders.Acquire(c.request.Context(), time.Duration(rt.config.QueueTimeout)*time.Second)

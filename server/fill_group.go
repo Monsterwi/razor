@@ -34,6 +34,7 @@ type fillGroup struct {
 
 type fillTask struct {
 	id                                     string
+	partialRoot                            string
 	token                                  *cache.FillToken
 	ctx                                    context.Context
 	cancel                                 context.CancelFunc
@@ -41,6 +42,8 @@ type fillTask struct {
 	done, creatorGone, privateDone, exited chan struct{}
 	private                                chan *http.Response
 	streamReady                            chan struct{}
+	partialReady                           chan struct{}
+	partial                                *partialGET
 	stream                                 *cache.CacheVC
 	rangeRun                               *rangeRun
 	result                                 fillResult
@@ -105,7 +108,7 @@ func (g *fillGroup) joinLocked(id string, token *cache.FillToken, cfg *config.Co
 		return nil, false, err
 	}
 	ctx, cancel := context.WithTimeout(g.ctx, time.Duration(cfg.SharedFillTimeout)*time.Second)
-	task := &fillTask{id: id, token: token, ctx: ctx, cancel: cancel, refs: 1, done: make(chan struct{}), creatorGone: make(chan struct{}), privateDone: make(chan struct{}), exited: make(chan struct{}), private: make(chan *http.Response), streamReady: make(chan struct{})}
+	task := &fillTask{id: id, token: token, ctx: ctx, cancel: cancel, refs: 1, done: make(chan struct{}), creatorGone: make(chan struct{}), privateDone: make(chan struct{}), exited: make(chan struct{}), private: make(chan *http.Response), streamReady: make(chan struct{}), partialReady: make(chan struct{})}
 	g.tasks[id] = task
 	g.active++
 	g.waiters++
@@ -169,14 +172,22 @@ func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []b
 	if resources.config.SharedFillPublicStatic == 1 {
 		r = resources.proxy.NormalizePublicRequest(r)
 	}
-	task, creator, err := s.fills.join(fillIdentity(r, key, resources.version), token, resources.config)
+	var task *fillTask
+	var creator bool
+	var err error
+	if blockGETEligible(r) {
+		task, creator, err = s.fills.joinPartial(fillIdentity(r, key, resources.version), partialDiscoveryKey(key, r), token, resources.config)
+	} else {
+		task, creator, err = s.fills.join(fillIdentity(r, key, resources.version), token, resources.config)
+	}
 	if err != nil {
 		resources.release()
 		s.counters.rejected.Add(1)
 		http.Error(w, "Cache fill unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	defer s.fills.leave(task, creator)
+	leave := sync.OnceFunc(func() { s.fills.leave(task, creator) })
+	defer leave()
 	if creator {
 		originRequest := withRequestRuntime(r, task.ctx, resources.runtime)
 		go func() {
@@ -191,6 +202,7 @@ func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []b
 	select {
 	case <-r.Context().Done():
 		return
+	case <-task.partialReady:
 	case <-task.streamReady:
 		streaming = true
 		// A fast producer may already have failed after publishing headers.
@@ -201,6 +213,30 @@ func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []b
 		default:
 		}
 	case <-task.done:
+	}
+	select {
+	case <-task.partialReady:
+		select {
+		case <-task.done:
+			if task.result.err != nil {
+				s.upstreamError(w, r, task.result.err)
+				return
+			}
+		default:
+		}
+		p := task.partial
+		initial := task
+		if !p.full {
+			initial = nil
+			leave()
+		}
+		s.servePartialObject(w, r, key, task.token, p.object, p.info, p.origin, true, false, initial)
+		return
+	default:
+	}
+	if !streaming && errors.Is(task.result.err, errRangeBypass) {
+		s.proxyWithoutCache(w, r)
+		return
 	}
 	if !streaming && creator && errors.Is(task.result.err, errUnshareable) {
 		status = "BYPASS"

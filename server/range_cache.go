@@ -415,7 +415,11 @@ func (s *Server) proxyRangeBypass(w http.ResponseWriter, r *http.Request, origin
 	}
 }
 func (s *Server) serveRange(w http.ResponseWriter, r *http.Request, root []byte) {
-	s.serveBlocks(w, r, root, false)
+	if s.hasPartialObject(r, root) {
+		s.serveBlocks(w, r, root, false)
+		return
+	}
+	s.serveRangeDiscovery(w, r, root)
 }
 func (s *Server) serveBlocks(w http.ResponseWriter, r *http.Request, root []byte, full bool) bool {
 	resources := s.captureFillResources(r)
@@ -488,14 +492,26 @@ func (s *Server) serveBlocks(w http.ResponseWriter, r *http.Request, root []byte
 		s.upstreamError(w, r, err)
 		return true
 	}
-	if full && m.Total <= max(int64(1<<20), m.ChunkBytes) {
-		return false
-	}
-	if value := r.Header.Get("If-Range"); value != "" && (!strongRangeTag(value) || value != m.ETag) {
-		full := r.Clone(r.Context())
-		full.Header.Del("Range")
-		full.Header.Del("If-Range")
-		s.proxyRangeBypass(w, full, origin)
+	return s.servePartialObject(w, r, root, parent, m, info, origin, full, hit, nil)
+}
+
+func (s *Server) servePartialObject(w http.ResponseWriter, r *http.Request, root []byte, parent *cache.FillToken, m *rangeObject, info *cache.CacheHTTPInfo, origin *proxy.Origin, full, hit bool, task *fillTask) bool {
+	if full && m.Total == 0 {
+		if task != nil {
+			select {
+			case <-r.Context().Done():
+				return true
+			case <-task.done:
+				if task.result.err != nil {
+					s.upstreamError(w, r, task.result.err)
+					return true
+				}
+			}
+		}
+		copyHeaders(w.Header(), info.ResponseHeaders)
+		w.Header().Del("Content-Range")
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusOK)
 		return true
 	}
 	start, end, err := requestedBlockBounds(r, m.Total, full)
@@ -509,7 +525,7 @@ func (s *Server) serveBlocks(w http.ResponseWriter, r *http.Request, root []byte
 		return true
 	}
 	first := start / m.ChunkBytes
-	cursor := &rangeCursor{s: s, request: r, root: root, parent: parent, object: m, origin: origin, last: end / m.ChunkBytes, segment: -1}
+	cursor := &rangeCursor{s: s, request: r, root: root, parent: parent, object: m, origin: origin, last: end / m.ChunkBytes, segment: -1, task: task}
 	defer cursor.close()
 	sub, err := cursor.open(first)
 	if errors.Is(err, errRangeBypass) {
