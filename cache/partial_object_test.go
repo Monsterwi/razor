@@ -259,6 +259,18 @@ func BenchmarkPartialCoverage(b *testing.B) {
 			}
 			b.ReportMetric(float64(len(data)), "segment-B")
 			b.ReportMetric(float64(DocHeaderSize+len(header)+len(data)), "record-B")
+			directory := c.Stripes[0].DirMgr
+			entries := directory.DirTrie.Snapshot()
+			textBytes := 0
+			for _, entry := range entries {
+				textBytes += len(entry.Key) + len(entry.Selector)
+			}
+			b.ReportMetric(float64(c.Stripes[0].Len), "stripe-B")
+			b.ReportMetric(float64(directory.BinarySize()), "directory-B")
+			b.ReportMetric(float64(directory.FragmentsNum), "directory-slots")
+			b.ReportMetric(float64(len(directory.identities)*len(directory.identities[0])), "identity-payload-B")
+			b.ReportMetric(float64(len(entries)), "index-records")
+			b.ReportMetric(float64(textBytes), "index-text-B")
 		})
 	}
 }
