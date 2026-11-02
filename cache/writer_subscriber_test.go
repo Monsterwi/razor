@@ -202,3 +202,56 @@ func TestWriterSubscriberReceivesFinalBytesWhenWriteAndCloseRaceRead(t *testing.
 		}
 	}
 }
+
+func TestWriterTerminalStateReleasesOwnershipBeforeReadersObserveIt(t *testing.T) {
+	for _, failed := range []bool{false, true} {
+		t.Run(fmt.Sprint(failed), func(t *testing.T) {
+			c := safetyCache(t)
+			key := []byte("writer-terminal-publication")
+			stripe := c.KeyToStripe(key)
+			writer := NewCacheWriter(stripe, key)
+			if _, added := stripe.OpenDir.Add(key, writer); !added {
+				t.Fatal("writer registration failed")
+			}
+			reader := NewCacheReaderFromWriter(stripe, key, writer)
+			cause := errors.New("source terminated")
+			if failed {
+				writer.Abort(cause)
+			} else {
+				if _, err := writer.Write([]byte("complete bytes")); err != nil {
+					t.Fatal(err)
+				}
+				if err := writer.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			body, err := io.ReadAll(reader)
+			if failed {
+				if !errors.Is(err, cause) || len(body) != 0 {
+					t.Fatalf("failed read %q %v", body, err)
+				}
+			} else {
+				if err != nil || string(body) != "complete bytes" {
+					t.Fatalf("completed read %q %v", body, err)
+				}
+				hit, err := c.OpenReadCommitted(key)
+				if err != nil {
+					t.Fatalf("successful EOF still exposes active writer: %v", err)
+				}
+				hit.Close()
+			}
+			replacement, err := c.OpenWrite(key, 0)
+			if err != nil {
+				t.Fatalf("terminal reader still blocked replacement: %v", err)
+			}
+			defer replacement.Abort(io.ErrClosedPipe)
+			// Repeated terminal calls must not release a newer writer at the same key.
+			writer.Close()
+			writer.Abort(cause)
+			if other, err := c.OpenWrite(key, 0); err == nil {
+				other.Abort(io.ErrClosedPipe)
+				t.Fatal("old terminal call released replacement")
+			}
+		})
+	}
+}

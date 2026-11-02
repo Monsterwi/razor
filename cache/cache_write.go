@@ -222,6 +222,8 @@ func (w *CacheWriter) abortLocked(err error) {
 	}
 	w.Stripe.mu.Unlock()
 	w.published = nil
+	// Terminal readability and active-key ownership change under the same writer lock.
+	w.Stripe.OpenDir.releaseWriter(w.Key, w.od)
 	if w.od != nil {
 		w.od.signalReady()
 	}
@@ -367,14 +369,13 @@ func (w *CacheWriter) Close() (closeErr error) {
 	w.buffer = nil
 	w.frag0Data = nil
 	w.published = nil
+	// Terminal readability and active-key ownership change under the same writer lock.
+	w.Stripe.OpenDir.releaseWriter(w.Key, w.od)
 	if w.od != nil {
 		w.od.signalReady()
 	}
 	// Notify any remaining readers that we are done (EOF)
 	w.cond.Broadcast()
-
-	// CacheVC releases active key ownership after Close returns. Existing
-	// subscribers retain this writer independently until their own Close.
 
 	return nil
 }
