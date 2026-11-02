@@ -104,7 +104,11 @@ func TestRangeBoundariesAndIfRange(t *testing.T) {
 		{"bytes=1-2", `W/"one"`, string(data), "", 200},
 	} {
 		t.Run(tc.value+tc.ifRange, func(t *testing.T) {
-			got := fetch(s, "http://cache.test/item", http.Header{"Range": {tc.value}, "If-Range": {tc.ifRange}})
+			headers := http.Header{"Range": {tc.value}}
+			if tc.ifRange != "" {
+				headers.Set("If-Range", tc.ifRange)
+			}
+			got := fetch(s, "http://cache.test/item", headers)
 			if got.Code != tc.status || got.Body.String() != tc.body || got.Header().Get("Content-Range") != tc.contentRange {
 				t.Fatalf("got=%d %q Content-Range=%q", got.Code, got.Body.String(), got.Header().Get("Content-Range"))
 			}

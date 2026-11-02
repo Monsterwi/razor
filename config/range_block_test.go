@@ -18,7 +18,7 @@ func TestRangeBlockConfiguration(t *testing.T) {
 				}
 			}
 			cfg, err := Load(dir)
-			valid := value >= 65536 && value <= 8388608 && value&(value-1) == 0
+			valid := value == 1048576
 			if valid && err != nil {
 				t.Fatal(err)
 			}

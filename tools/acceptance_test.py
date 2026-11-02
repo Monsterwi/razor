@@ -2,6 +2,7 @@ import os
 from contextlib import ExitStack
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -92,6 +93,23 @@ class PortReservationTest(unittest.TestCase):
 
 
 class PublicCLITest(unittest.TestCase):
+    def test_tools_reject_nonfixed_chunk_size_before_side_effects(self):
+        for script in ("acceptance.py", "hey_benchmark.py"):
+            for block in (65536, 4194304):
+                with self.subTest(script=script, block_bytes=block), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    command = [sys.executable, str(Path(__file__).with_name(script)),
+                               "--binary", str(root / "missing-razor"),
+                               "--output", str(root / "output"), "--cache-root", str(root / "cache"),
+                               "--block-bytes", str(block)]
+                    if script == "hey_benchmark.py":
+                        command += ["--hey", str(root / "missing-hey"), "--fixtures", str(root / "fixtures")]
+                    result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("--block-bytes: invalid choice", result.stderr)
+                    self.assertFalse((root / "output").exists())
+                    self.assertFalse((root / "cache").exists())
+
     def test_public_ats_combinations_rejected_before_side_effects(self):
         for mode in ("benchmark", "all"):
             for products in (("ats",), ("razor", "ats")):
@@ -113,7 +131,8 @@ class PublicCLITest(unittest.TestCase):
         for mode, public, products in (("benchmark", True, ["razor"]), ("all", True, ["razor"]), ("benchmark", False, ["ats"])):
             with self.subTest(mode=mode, public=public), tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
                 argv = ["acceptance.py", "--binary", "/missing/razor", "--output", str(Path(directory) / "output"),
-                        "--mode", mode, "--products", *products, "--ats-environment", "/missing/ats.json"]
+                        "--mode", mode, "--products", *products, "--ats-environment", "/missing/ats.json",
+                        "--block-bytes", "1048576"]
                 if public:
                     argv.append("--public-static")
                 cleanup.enter_context(patch.object(sys, "argv", argv))

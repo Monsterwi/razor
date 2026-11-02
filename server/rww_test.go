@@ -124,7 +124,7 @@ func blockServer(t *testing.T, cfg *config.Config, path string, diskBytes int64,
 	return s
 }
 func TestConfiguredRangeBlocksAndNonAlignedTail(t *testing.T) {
-	for _, size := range []int{64 << 10, 1 << 20, 4 << 20} {
+	for _, size := range []int{1 << 20} {
 		t.Run(fmt.Sprint(size), func(t *testing.T) {
 			data := bytes.Repeat([]byte("0123456789abcdef"), (3*size+128)/16)
 			data = data[:3*size+17]
@@ -257,7 +257,7 @@ func TestPublicGETAndOverlappingRangeShareBlockProducers(t *testing.T) {
 }
 
 func TestPublicGET100MiBThroughMinimumBudgetAndDiskWindow(t *testing.T) {
-	for _, blockSize := range []int{4 << 20, 8 << 20} {
+	for _, blockSize := range []int{1 << 20} {
 		t.Run(fmt.Sprint(blockSize), func(t *testing.T) {
 			const total int64 = 100 << 20
 			var originBytes atomic.Int64
@@ -345,7 +345,7 @@ func TestBlockLayoutRestartAndReloadIsolation(t *testing.T) {
 	for _, tc := range []struct {
 		size  int
 		total int64
-	}{{1 << 20, 1 << 20}, {4 << 20, 5 << 20}, {1 << 20, 5 << 20}} {
+	}{{1 << 20, 1 << 20}, {1 << 20, 1 << 20}} {
 		cfg := config.GetDefaultConfig()
 		cfg.RangeBlockBytes = tc.size
 		s := blockServer(t, cfg, path, 64<<20, origin.URL)
@@ -355,7 +355,7 @@ func TestBlockLayoutRestartAndReloadIsolation(t *testing.T) {
 		}
 		candidate := *cfg
 		candidate.RangeBlockBytes = 64 << 10
-		if err := s.Reload(&candidate); err == nil || !strings.Contains(err.Error(), "restart") {
+		if err := s.Reload(&candidate); err == nil || !strings.Contains(err.Error(), "range_block_bytes") {
 			t.Fatalf("layout reload accepted: %v", err)
 		}
 		if err := s.Shutdown(); err != nil {
@@ -495,7 +495,7 @@ func TestPublicSmallObjectKeepsWholePath(t *testing.T) {
 	defer origin.Close()
 	cfg := config.GetDefaultConfig()
 	cfg.SharedFillPublicStatic = 1
-	cfg.RangeBlockBytes = 64 << 10
+	cfg.RangeBlockBytes = 1 << 20
 	s := blockServer(t, cfg, filepath.Join(t.TempDir(), "cache"), 32<<20, origin.URL)
 	for range 2 {
 		got := fetch(s, "http://cache.test/small", http.Header{"Accept-Encoding": {"identity"}})
@@ -525,7 +525,7 @@ func TestSingleBlockRequestIgnoresUnrelatedSmallStripe(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.GetDefaultConfig()
-	cfg.RangeBlockBytes = 4 << 20
+	cfg.RangeBlockBytes = 1 << 20
 	cfg.UpstreamTargets = []string{origin.URL}
 	p, err := proxy.NewHTTPProxy(cfg.UpstreamTargets, cfg.UpstreamAlgo)
 	if err != nil {

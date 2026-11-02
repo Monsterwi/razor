@@ -32,7 +32,7 @@ func (c *Cache) fillSnapshotLocked(selector []byte) ([]fillHead, error) {
 }
 
 func (c *Cache) rangeSnapshotLocked(selector []byte) ([]fillHead, error) {
-	prefix := append(append([]byte(nil), selector...), []byte("\nrange:manifest:")...)
+	prefix := append(append([]byte(nil), selector...), []byte(PartialObjectPrefix)...)
 	var heads []fillHead
 	for _, s := range c.Stripes {
 		keys, err := s.DirMgr.DirTrie.KeysForPrefixLimit(prefix, MaxFillVariants-len(heads))

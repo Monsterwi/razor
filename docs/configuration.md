@@ -5,7 +5,7 @@
 | 键 | 默认 | 范围 / 含义 |
 | --- | --- | --- |
 | shared_fill_public_static | 0 | INT 0/1；开启前须确认内容不随客户端身份变化 |
-| range_block_bytes | 1048576 | 64 KiB–8 MiB，2 的幂 |
+| range_block_bytes | 1048576 | 固定 1 MiB；其他值拒绝加载 |
 | ram_cache_algorithm | otter | otter / s3-fifo |
 | ram_cache_bytes | 10485760 | 每 stripe 权重预算；0 禁用，非零至多 1 TiB |
 

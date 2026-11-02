@@ -105,8 +105,8 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("proxy.config.%s must be between %d and %d", f.name, f.min, f.max)
 		}
 	}
-	if c.RangeBlockBytes&(c.RangeBlockBytes-1) != 0 {
-		return fmt.Errorf("proxy.config.cache.range_block_bytes must be a power of two")
+	if c.RangeBlockBytes != 1<<20 {
+		return fmt.Errorf("proxy.config.cache.range_block_bytes must be 1048576")
 	}
 	if c.CacheWriteBufferBytes < c.CacheWriterReservation() {
 		return fmt.Errorf("cache write budget cannot hold one writer (%d bytes)", c.CacheWriterReservation())

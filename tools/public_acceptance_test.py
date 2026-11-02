@@ -97,10 +97,9 @@ class PublicToolsTest(unittest.TestCase):
     def test_real_binary_public_contracts_both_policies(self):
         from public_acceptance import public_functional
         for algorithm in ("otter", "s3-fifo"):
-            for block in (64 << 10, MIB, 4 * MIB):
-                with self.subTest(algorithm=algorithm, block_bytes=block), tempfile.TemporaryDirectory() as directory:
-                    root = Path(directory)
-                    fixtures = create_fixtures(root / "fixtures", max(4 * MIB, 3 * block))
-                    args = SimpleNamespace(binary=Path(os.environ["RAZOR_ACCEPTANCE_BINARY"]), cache_root=None,
-                        public_static=True, ram_algorithm=algorithm, ram_bytes=10 * MIB, block_bytes=block)
-                    public_functional(args, fixtures, root, smoke=True)
+            with self.subTest(algorithm=algorithm), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                fixtures = create_fixtures(root / "fixtures", 4 * MIB)
+                args = SimpleNamespace(binary=Path(os.environ["RAZOR_ACCEPTANCE_BINARY"]), cache_root=None,
+                    public_static=True, ram_algorithm=algorithm, ram_bytes=10 * MIB, block_bytes=MIB)
+                public_functional(args, fixtures, root, smoke=True)
