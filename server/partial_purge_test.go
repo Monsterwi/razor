@@ -250,3 +250,110 @@ func TestPartialPurgeOldRangeVersionFailureDoesNotRetryOrRetireNew(t *testing.T)
 		t.Fatalf("old private run retried or retired new: GET=%d refused=%d err=%v", gets.Load(), refused.Load(), err)
 	}
 }
+
+func TestPartialPurgeOldCursorsShareSubsequentPrivateRun(t *testing.T) {
+	data := bytes.Repeat([]byte("shared-private-"), (4<<20)/15+1)
+	firstGate, nextGate := make(chan struct{}), make(chan struct{})
+	releaseFirst, releaseNext := sync.OnceFunc(func() { close(firstGate) }), sync.OnceFunc(func() { close(nextGate) })
+	var firstCalls, nextCalls atomic.Int32
+	s, _ := purgeServer(t, "test-secret", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"shared-old"`)
+		w.Header().Set("Cache-Control", "public,max-age=3600")
+		if r.Method == "HEAD" {
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+			return
+		}
+		var start, end int
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
+			t.Error(err)
+			w.WriteHeader(400)
+			return
+		}
+		gate := firstGate
+		if start == 0 {
+			firstCalls.Add(1)
+		} else if start == 2<<20 {
+			nextCalls.Add(1)
+			gate = nextGate
+		} else {
+			t.Errorf("unexpected interval %s", r.Header.Get("Range"))
+		}
+		if r.Header.Get("If-Match") != `"shared-old"` {
+			t.Error("old run lost validator")
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+		w.WriteHeader(206)
+		_, _ = w.Write(data[start : start+(6<<10)])
+		w.(http.Flusher).Flush()
+		select {
+		case <-gate:
+			_, _ = w.Write(data[start+(6<<10) : end+1])
+		case <-r.Context().Done():
+		}
+	})
+	front := httptest.NewServer(s)
+	t.Cleanup(front.Close)
+	t.Cleanup(releaseNext)
+	t.Cleanup(releaseFirst)
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DisableCompression: true}}
+	responses := make([]*http.Response, 0, 2)
+	for _, start := range []int{17, 33} {
+		req, _ := http.NewRequest("GET", front.URL+"/shared-private", nil)
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, (3<<20)+17))
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		responses = append(responses, resp)
+		defer resp.Body.Close()
+		prefix := make([]byte, 4096)
+		if _, err = io.ReadFull(resp.Body, prefix); err != nil || !bytes.Equal(prefix, data[start:start+4096]) {
+			t.Fatal("client prefix missing")
+		}
+	}
+	req, _ := http.NewRequest("PURGE", front.URL+"/shared-private", nil)
+	req.Header.Set("Authorization", "Bearer test-secret")
+	purged, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, purged.Body)
+	purged.Body.Close()
+	if purged.StatusCode != 200 {
+		t.Fatal(purged.StatusCode)
+	}
+	type result struct {
+		index int
+		err   error
+	}
+	arrived := make(chan result, 2)
+	for index, resp := range responses {
+		go func() {
+			start := []int{17, 33}[index]
+			body := make([]byte, (2<<20)-start)
+			_, err := io.ReadFull(resp.Body, body)
+			if err == nil && !bytes.Equal(body, data[start+4096:(2<<20)+4096]) {
+				err = fmt.Errorf("private run prefix differs")
+			}
+			arrived <- result{index, err}
+		}()
+	}
+	releaseFirst()
+	for range 2 {
+		result := <-arrived
+		if result.err != nil {
+			t.Fatalf("client%d private prefix: %v", result.index, result.err)
+		}
+	}
+	if firstCalls.Load() != 1 || nextCalls.Load() != 1 {
+		t.Fatalf("duplicate private inflight work first=%d next=%d", firstCalls.Load(), nextCalls.Load())
+	}
+	releaseNext()
+	for _, resp := range responses {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil || !bytes.Equal(body, data[(2<<20)+4096:(3<<20)+18]) {
+			t.Fatalf("private shared tail bytes=%d err=%v", len(body), err)
+		}
+	}
+}

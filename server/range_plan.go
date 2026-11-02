@@ -44,10 +44,15 @@ func (g *fillGroup) claimRange(identity, object string, first, last int64, token
 		private = true
 	}
 	for _, task := range g.tasks {
-		if private {
-			break // A continued old response never joins a new request's work.
+		if task.ctx.Err() != nil {
+			continue
 		}
-		if p := task.partial; p != nil && p.full && p.key == object && task.ctx.Err() == nil && g.cache.CheckFill(task.token) == nil {
+		if err := g.cache.CheckFill(task.token); err != nil && !(started && errors.Is(err, cache.ErrPurged)) {
+			continue
+		}
+		// Already-started old cursors can share their old interval. New
+		// requests have no permission to join a revoked task.
+		if p := task.partial; p != nil && p.full && p.key == object {
 			p.mu.Lock()
 			current := p.index
 			p.mu.Unlock()
@@ -62,7 +67,7 @@ func (g *fillGroup) claimRange(identity, object string, first, last int64, token
 			}
 		}
 		run := task.rangeRun
-		if run == nil || run.object != object || task.ctx.Err() != nil || g.cache.CheckFill(task.token) != nil {
+		if run == nil || run.object != object {
 			continue
 		}
 		for index := run.first; index <= run.last; index++ {
