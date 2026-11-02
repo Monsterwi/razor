@@ -115,7 +115,7 @@ func TestPreparedRangeBlockEvictedBeforeSendRecovers(t *testing.T) {
 				}
 				w.Header().Set("ETag", tag)
 				w.Header().Set("Cache-Control", "public,max-age=3600")
-				if r.Method == "GET" && r.Header.Get("Range") == "bytes=1048576-2097151" {
+				if start, end, ok := originInterval(r); r.Method == "GET" && ok && start <= 1<<20 && end >= (2<<20)-1 {
 					mu.Lock()
 					active++
 					gets++
