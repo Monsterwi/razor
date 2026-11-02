@@ -93,7 +93,7 @@ def barrier_response(product, origin, client, path, full=False):
         c.close()
 
 
-def purge_active_response(product, origin, client, full=False, prefix=False, retain_old=True):
+def purge_active_response(product, origin, client, full=False, prefix=False, retain_old=True, old_finishes_last=False):
     """Both generations have real client bytes before the old stream is released."""
     path = "/large-purge-" + ("prefix" if prefix else "exact") + ("-get/item" if full else "-range/item")
     if not retain_old:
@@ -138,6 +138,12 @@ def purge_active_response(product, origin, client, full=False, prefix=False, ret
         new_first = new.read(gate_at - 1)
         assert (len(new_first), hashlib.sha256(new_first).hexdigest()) == client.expected(path, version=2, bounds=(0, gate_at - 2))
         assert new_entered.wait(5) and not gate.is_set(), "new generation failed to start independently"
+        if old_finishes_last:
+            new_gate.set()
+            assert finish(new, new_first) == client.expected(path, version=2)
+            wait_for(lambda: any(row["path"] == path and row.get("etag") == '"large-v2"'
+                                 and not row["range"] and "end" in row for row in origin.records),
+                     "new generation finishes before the old stream resumes")
         gate.set()
         if full:
             wait_for(lambda: any(row["path"] == path and row.get("etag") == '"large-v1"'
@@ -149,9 +155,10 @@ def purge_active_response(product, origin, client, full=False, prefix=False, ret
         else:
             assert 0 < length < end - start + 1, length
             assert (length, digest) == client.expected(path, bounds=(start, start + length - 1))
-        assert not new_gate.is_set(), "old subscription must leave while the new producer is active"
-        new_gate.set()
-        assert finish(new, new_first) == client.expected(path, version=2)
+        if not old_finishes_last:
+            assert not new_gate.is_set(), "old subscription must leave while the new producer is active"
+            new_gate.set()
+            assert finish(new, new_first) == client.expected(path, version=2)
         wait_for(lambda: all("end" in row for row in origin.records if row["path"] == path), "both generations' origin requests finished")
         before = origin.snapshot(path)
         repair_bytes = 0
@@ -187,7 +194,7 @@ def purge_active_response(product, origin, client, full=False, prefix=False, ret
         assert hot_headers["etag"] == '"large-v2"' and hot_headers["content-length"] == "17", hot
         assert hot_headers["content-range"] == f"bytes 7-23/{total}", hot
         assert origin.snapshot(path) == before, (before, origin.snapshot(path))
-        return {"old_status": old.status, "old_bytes": length, "old_sha256": digest,
+        return {"path": path, "old_status": old.status, "old_bytes": length, "old_sha256": digest,
                 "old_completed": retain_old, "client_prefix_before_purge": len(first),
                 "origin": before, "old_chunk_repair_bytes": repair_bytes, "new_generation_still_hot": True}
     finally:
