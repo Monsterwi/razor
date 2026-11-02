@@ -122,6 +122,11 @@ class Origin:
                     row = {"path": path, "method": self.command, "bytes": 0,
                            "range": self.headers.get("Range"), "time": time.time(), "status": 0,
                            "remote_ip": self.client_address[0], "headers": dict(self.headers)}
+                    if rule.get("retain_old_version"):
+                        row["ordinary_get_bytes_at_start"] = {
+                            previous["etag"]: previous["bytes"] for previous in owner.records
+                            if previous["path"] == path and previous["method"] == "GET"
+                            and not previous["range"] and "etag" in previous}
                     owner.records.append(row)
                     if rule.get("switch_after_get") and sum(r["method"] == "GET" and r["path"] == path for r in owner.records) > rule["switch_after_get"]:
                         rule["version"] = owner.rules[path]["version"] = 2
@@ -131,6 +136,8 @@ class Origin:
                 fixture = owner.fixtures[(size, rule.get("version", owner.version))]
                 total = fixture.stat().st_size
                 tag = '"%s-v%d"' % (size, rule.get("version", owner.version))
+                with owner.lock:
+                    row["etag"] = tag
                 status, start, end = 200, 0, total - 1
                 if path == "/health" and not owner.healthy:
                     status = 503

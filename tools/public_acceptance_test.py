@@ -50,6 +50,30 @@ class PublicToolsTest(unittest.TestCase):
                            status=206, expected=client.expected(path, bounds=(17, 23)))
             client.checked(product, path, headers={"Range": "bytes=17-23", "If-Match": '"unknown"'}, status=412, expected=None)
 
+    def test_origin_records_get_progress_before_old_chunk_repair(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            root = Path(directory)
+            fixtures = create_fixtures(root / "fixtures", 2 * MIB)
+            origin = Origin(fixtures, root / "origin.json")
+            cleanup.callback(origin.close)
+            client = Client(fixtures, root)
+            cleanup.callback(client.raw.close)
+            entered, gate = threading.Event(), threading.Event()
+            cleanup.callback(gate.set)
+            path = "/large-progress"
+            origin.rules[path] = {"body_gate_at": MIB, "entered": entered, "gate": gate}
+            connection = http.client.HTTPConnection("127.0.0.1", origin.server.server_port, timeout=3)
+            cleanup.callback(connection.close)
+            connection.request("GET", path)
+            response = connection.getresponse()
+            self.assertEqual(len(response.read(MIB)), MIB)
+            self.assertTrue(entered.wait(1))
+            origin.rules[path] = {"version": 2, "retain_old_version": True}
+            product = SimpleNamespace(kind="origin", port=origin.server.server_port)
+            client.checked(product, path, headers={"Range": "bytes=0-16", "If-Match": '"large-v1"'},
+                           status=206, expected=client.expected(path, bounds=(0, 16)))
+            self.assertEqual(origin.records[-1]["ordinary_get_bytes_at_start"], {'"large-v1"': MIB})
+
     def test_body_gate_uses_absolute_offset_inside_one_range_response(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             root = Path(directory)

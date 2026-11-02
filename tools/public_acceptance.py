@@ -139,6 +139,10 @@ def purge_active_response(product, origin, client, full=False, prefix=False, ret
         assert (len(new_first), hashlib.sha256(new_first).hexdigest()) == client.expected(path, version=2, bounds=(0, gate_at - 2))
         assert new_entered.wait(5) and not gate.is_set(), "new generation failed to start independently"
         gate.set()
+        if full:
+            wait_for(lambda: any(row["path"] == path and row.get("etag") == '"large-v1"'
+                                 and not row["range"] and row["bytes"] == total for row in origin.records),
+                     "old GET producer finishes while its client is paused")
         length, digest = finish(old, first)
         if retain_old:
             assert (length, digest) == client.expected(path, bounds=(start, end)), (length, old.getheaders())
@@ -148,14 +152,28 @@ def purge_active_response(product, origin, client, full=False, prefix=False, ret
         assert not new_gate.is_set(), "old subscription must leave while the new producer is active"
         new_gate.set()
         assert finish(new, new_first) == client.expected(path, version=2)
-        old_origin_bytes = total if full else min(total, 4 * MIB)
-        if not retain_old:
-            old_origin_bytes = 2 * MIB
-        expected_origin_bytes = total + old_origin_bytes
-        wait_for(lambda: origin.snapshot(path)["bytes"] == expected_origin_bytes, "both generations' exact origin bytes")
+        wait_for(lambda: all("end" in row for row in origin.records if row["path"] == path), "both generations' origin requests finished")
         before = origin.snapshot(path)
-        assert before["get"] == (2 if full else 3), before
-        if not full:
+        repair_bytes = 0
+        if full:
+            rows = [row for row in origin.records if row["path"] == path]
+            ordinary = [row for row in rows if row["method"] == "GET" and not row["range"]]
+            assert [(row["etag"], row["bytes"]) for row in ordinary] == [('"large-v1"', total), ('"large-v2"', total)], ordinary
+            assert before["head"] == 0, before
+            repaired = set()
+            for row in rows:
+                if not row["range"]:
+                    continue
+                left, right = map(int, row["range"].removeprefix("bytes=").split("-"))
+                assert row["method"] == "GET" and row["status"] == 206 and row["headers"].get("If-Match") == '"large-v1"', row
+                assert 0 <= left <= right < total and left % MIB == 0 and right == min(left + MIB, total) - 1, row
+                assert right < row["ordinary_get_bytes_at_start"].get('"large-v1"', 0), row
+                assert left not in repaired and row["bytes"] == right - left + 1, row
+                repaired.add(left)
+                repair_bytes += row["bytes"]
+            assert before["get"] == 2 + len(repaired) and before["bytes"] == 2 * total + repair_bytes, before
+        else:
+            assert before["get"] == 3 and before["bytes"] == total + (min(total, 4 * MIB) if retain_old else 2 * MIB), before
             old_ranges = [row for row in origin.records if row["path"] == path and row["method"] == "GET" and row["range"]]
             assert [row["range"] for row in old_ranges] == [f"bytes=0-{2 * MIB - 1}", f"bytes={2 * MIB}-{min(total, 4 * MIB) - 1}"], old_ranges
             assert all(row["headers"].get("If-Match") == '"large-v1"' for row in old_ranges), old_ranges
@@ -171,7 +189,7 @@ def purge_active_response(product, origin, client, full=False, prefix=False, ret
         assert origin.snapshot(path) == before, (before, origin.snapshot(path))
         return {"old_status": old.status, "old_bytes": length, "old_sha256": digest,
                 "old_completed": retain_old, "client_prefix_before_purge": len(first),
-                "origin": before, "new_generation_still_hot": True}
+                "origin": before, "old_chunk_repair_bytes": repair_bytes, "new_generation_still_hot": True}
     finally:
         gate.set()
         new_gate.set()
