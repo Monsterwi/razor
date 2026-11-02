@@ -22,6 +22,7 @@ type PartialObject struct {
 	ChunkBytes                        int64
 	Total                             int64
 	ETag, Origin, Variant, Generation string
+	Revision                          uint64 `json:"-"`
 }
 
 func PartialObjectKey(root []byte, origin, variant string) []byte {
@@ -40,7 +41,7 @@ func (m *PartialObject) segmentKey(root []byte, index int64) []byte {
 func (m *PartialObject) MarshalBinary() ([]byte, error) { return json.Marshal(m) }
 
 func (c *Cache) ReadPartialObject(key []byte, origin, variant string) (*PartialObject, *CacheHTTPInfo, error) {
-	data, info, _, err := c.readPartialRecord(key)
+	data, info, revision, err := c.readPartialRecord(key)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -48,6 +49,7 @@ func (c *Cache) ReadPartialObject(key []byte, origin, variant string) (*PartialO
 	if json.Unmarshal(data, &m) != nil || m.Version != PartialFormatVersion || m.ChunkBytes != PartialChunkBytes || m.Total < 0 || m.Origin != origin || m.Variant != variant || len(m.Generation) != 32 {
 		return nil, nil, errors.New("invalid partial object metadata")
 	}
+	m.Revision = revision
 	return &m, info, nil
 }
 func (c *Cache) readPartialRecord(key []byte) ([]byte, *CacheHTTPInfo, uint64, error) {

@@ -224,8 +224,11 @@ func TestPreparedRangeBlockEvictedBeforeSendRecovers(t *testing.T) {
 			if peak != 1 {
 				t.Fatalf("duplicate active block producer: %d", peak)
 			}
-			if scenario.change != "" && gets != before {
-				t.Fatalf("invalidated old block recovered: before=%d after=%d", before, gets)
+			if scenario.change == "purge" && gets != before {
+				t.Fatalf("purged old block recovered: before=%d after=%d", before, gets)
+			}
+			if scenario.change == "version" && gets != before+1 {
+				t.Fatalf("old missing version must be attempted once without retry: before=%d after=%d", before, gets)
 			}
 			if scenario.change == "" && gets < 2 {
 				t.Fatalf("did not exercise block recovery: GETs=%d", gets)

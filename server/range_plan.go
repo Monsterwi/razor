@@ -120,8 +120,8 @@ func (c *rangeCursor) open(index int64) (*rangeSubscription, error) {
 	return &rangeSubscription{body: reader, close: reader.close, wait: func() error { return reader.sub.wait() }, reused: reader.sub.reused}, nil
 }
 
-// A slow subscriber can outlive the disk's rolling allocation. Recover only a
-// missing local fragment, once, under the original parent and strong validator.
+// A slow subscriber can outlive the disk's rolling allocation. Recover a missing
+// active fragment or invalid completed chunk once under the original validator.
 // Origin errors and version changes are terminal; already sent bytes are skipped.
 // The original cursor retains demand for the following chunk during recovery.
 type rangeChunkReader struct {
@@ -131,7 +131,7 @@ type rangeChunkReader struct {
 }
 
 func (r *rangeChunkReader) recover(err error) error {
-	if r.recovery != nil || !errors.Is(err, cache.ErrNotResident) {
+	if r.recovery != nil || (!errors.Is(err, cache.ErrNotResident) && !errors.Is(err, errRangeCachedChunk)) {
 		return err
 	}
 	if r.sub != nil {
@@ -207,6 +207,9 @@ func (c *rangeCursor) openChunk(index int64) (*rangeSubscription, error) {
 			return &rangeSubscription{body: bytes.NewReader(data), close: release, wait: func() error { return nil }, reused: true}, nil
 		}
 		release()
+		if err := c.repairCoverage(index, info); err != nil {
+			return nil, err
+		}
 		c.coverage.Bits &^= mask
 	}
 	if err := c.s.checkRangeVersion(c.root, c.parent, c.object); err != nil {
@@ -303,7 +306,7 @@ func (c *rangeCursor) subscribe(index int64) (*rangeSubscription, error) {
 	if completed {
 		data, _, release, err := c.s.readRangeBlock(c.request, rangeBlockKey(c.root, c.object, index), c.object, index, false)
 		if err != nil {
-			return nil, err
+			return nil, completedRangeReadError(err)
 		}
 		return &rangeSubscription{body: bytes.NewReader(data), close: release, wait: wait}, nil
 	}

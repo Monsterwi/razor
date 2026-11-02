@@ -76,18 +76,10 @@ func (s *Server) readRangeObjectData(key []byte, origin, variant string, size in
 	return m, info, err
 }
 
-// Missing object metadata is unknown, not a new version; fixed ETag block
-// validation still protects streaming through a cache smaller than the object.
+// The response keeps its selected representation; a newer metadata record does
+// not invalidate obtainable old chunks. Publication still obeys cache epochs.
 func (s *Server) checkRangeVersion(root []byte, parent *cache.FillToken, m *rangeObject) error {
-	if err := s.cache.CheckFill(parent); err != nil {
-		return err
-	}
-	key := rangeObjectKey(root, m.Origin, m.Variant, m.ChunkBytes)
-	current, _, err := s.readRangeObjectData(key, m.Origin, m.Variant, m.ChunkBytes)
-	if err == nil && (current.ETag != m.ETag || current.Total != m.Total) {
-		return errRangeChanged
-	}
-	return nil
+	return s.cache.CheckFill(parent)
 }
 
 func strongRangeTag(tag string) bool { return validETag(tag) && !strings.HasPrefix(tag, "W/") }
@@ -353,15 +345,7 @@ func (s *Server) rangeBlockFresh(r *http.Request, info *cache.CacheHTTPInfo) boo
 }
 
 func (s *Server) invalidateRange(r *http.Request, root []byte, parent *cache.FillToken, m *rangeObject) {
-	key := rangeObjectKey(root, m.Origin, m.Variant, m.ChunkBytes)
-	token, err := s.cache.DeriveFill(parent, key)
-	if err == nil {
-		current, _, err := s.readRangeObject(r, key, m.Origin, m.Variant, m.ChunkBytes)
-		if err == nil && current.Generation == m.Generation {
-			_ = s.cache.InvalidateFill(token)
-		}
-	}
-	_ = s.cache.InvalidateFill(parent)
+	_ = s.cache.InvalidatePartialObject(parent, root, m)
 }
 
 type rangeSubscription struct {

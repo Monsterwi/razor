@@ -404,11 +404,11 @@ func TestProxyCacheKeyUsesTrustedForwardedScheme(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct{ name, peer, proto, connection, want string }{
-		{"direct", "198.51.100.1:1234", "", "", "http-v3:http://public.example/a%2Fb?x=1"},
-		{"spoofed", "198.51.100.1:1234", "https", "", "http-v3:http://public.example/a%2Fb?x=1"},
-		{"trusted-http", "192.0.2.10:1234", "http", "", "http-v3:http://public.example/a%2Fb?x=1"},
-		{"trusted-https", "192.0.2.10:1234", "https", "", "http-v3:https://public.example/a%2Fb?x=1"},
-		{"hop-header", "192.0.2.10:1234", "https", "X-Forwarded-Proto", "http-v3:http://public.example/a%2Fb?x=1"},
+		{"direct", "198.51.100.1:1234", "", "", "http-v4:http://public.example/a%2Fb?x=1"},
+		{"spoofed", "198.51.100.1:1234", "https", "", "http-v4:http://public.example/a%2Fb?x=1"},
+		{"trusted-http", "192.0.2.10:1234", "http", "", "http-v4:http://public.example/a%2Fb?x=1"},
+		{"trusted-https", "192.0.2.10:1234", "https", "", "http-v4:https://public.example/a%2Fb?x=1"},
+		{"hop-header", "192.0.2.10:1234", "https", "X-Forwarded-Proto", "http-v4:http://public.example/a%2Fb?x=1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := httptest.NewRequest(http.MethodGet, "http://public.example/a%2Fb?x=1", nil)

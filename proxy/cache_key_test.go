@@ -30,7 +30,7 @@ func TestCacheKeySeparatesCompleteRequestIdentity(t *testing.T) {
 	}
 }
 
-func TestCacheKeyIgnoresOnlyQueryOrder(t *testing.T) {
+func TestCacheKeyPreservesQueryOrder(t *testing.T) {
 	for _, queries := range [][2]string{
 		{"a=1&b=2", "b=2&a=1"},
 		{"a=1&a=2&b=2", "b=2&a=2&a=1"},
@@ -42,8 +42,8 @@ func TestCacheKeyIgnoresOnlyQueryOrder(t *testing.T) {
 		t.Run(queries[1], func(t *testing.T) {
 			first := httptest.NewRequest("GET", "http://a.test/item?"+queries[0], nil)
 			second := httptest.NewRequest("GET", "http://a.test/item?"+queries[1], nil)
-			if got, want := GetCacheKey(second), GetCacheKey(first); got != want {
-				t.Fatalf("query permutation split cache identity: %q != %q", got, want)
+			if got, want := GetCacheKey(second), GetCacheKey(first); got == want {
+				t.Fatalf("query permutation shared cache identity: %q == %q", got, want)
 			}
 			if first.URL.RawQuery != queries[0] || second.URL.RawQuery != queries[1] {
 				t.Fatal("cache lookup rewrote the origin query")
