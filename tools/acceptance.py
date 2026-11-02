@@ -573,8 +573,10 @@ def functional(args, fixtures, output):
         client.checked(product, path, headers={"Cache-Control": "no-cache"})
         assert origin.snapshot(path)["get"] == 2
         client.checked(product, path, headers={"If-None-Match": '"small-v1"'}, status=304, expected=None)
-        assert origin.snapshot(path)["get"] == 2
-        record("small MISS/HIT/REVALIDATE/client304", origin=origin.snapshot(path))
+        assert origin.snapshot(path)["get"] == 3
+        conditional = [row for row in origin.records if row["path"] == path][-1]
+        assert conditional["headers"].get("If-None-Match") == '"small-v1"' and conditional["status"] == 304 and conditional["bytes"] == 0, conditional
+        record("small MISS/HIT/REVALIDATE and conditional passthrough304", origin=origin.snapshot(path))
         for path, headers in [("/small-private", {}), ("/small-auth", {"Authorization": "Bearer test-only"})]:
             origin.rules[path] = {"cache_control": "private, max-age=3600"}
             for _ in range(2):
