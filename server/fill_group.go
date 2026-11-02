@@ -183,6 +183,13 @@ func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []b
 		return
 	case <-task.streamReady:
 		streaming = true
+		// A fast producer may already have failed after publishing headers.
+		// Prefer its terminal result to treating that failure as a cache miss.
+		select {
+		case <-task.done:
+			streaming = false
+		default:
+		}
 	case <-task.done:
 	}
 	if !streaming && creator && errors.Is(task.result.err, errUnshareable) {
@@ -222,6 +229,11 @@ func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []b
 		return
 	}
 	if err := s.cache.CheckFill(task.token); err != nil {
+		if streaming {
+			// A stream can invalidate itself after discovering unsafe trailers.
+			http.Error(w, "Cache fill unavailable", http.StatusBadGateway)
+			return
+		}
 		http.Error(w, "Cache fill invalidated", http.StatusServiceUnavailable)
 		return
 	}

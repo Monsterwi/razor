@@ -138,6 +138,14 @@ func (s *Server) serveCacheHit(w http.ResponseWriter, r *http.Request, vc *cache
 	if r.Method == http.MethodHead {
 		return
 	}
+	if vc.IsRWW() {
+		// Headers have passed shared-cache admission. Make the start of the
+		// response observable even if the producer fails before the first byte;
+		// an unflushed abort on a reused connection can trigger client retries.
+		if err := http.NewResponseController(w).Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			panic(http.ErrAbortHandler)
+		}
+	}
 	if err := s.streamResponse(w, vc, r); err != nil {
 		logger.Errorf("Cache response transfer failed: %v", err)
 		panic(http.ErrAbortHandler)

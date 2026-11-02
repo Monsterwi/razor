@@ -29,12 +29,12 @@ func assertFailedSharedHTTP(t *testing.T, client *http.Client, target string) {
 		return
 	}
 	defer resp.Body.Close()
-	_, err = io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusBadGateway && err == nil {
 		return
 	}
 	if resp.StatusCode != http.StatusOK || !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Errorf("failed fill ended as status=%d err=%v", resp.StatusCode, err)
+		t.Errorf("failed fill ended as status=%d body=%q err=%v", resp.StatusCode, body, err)
 	}
 }
 

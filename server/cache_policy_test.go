@@ -361,7 +361,7 @@ func TestLateTrailersPreventCaching(t *testing.T) {
 		assertFailedSharedHTTP(t, front.Client(), front.URL+"/item")
 	}
 	if calls.Load() != 2 {
-		t.Fatal("unannounced late response trailers were cached")
+		t.Fatalf("two requests for rejected trailers made %d origin calls (%d cache requests)", calls.Load(), s.Stats().Requests)
 	}
 }
 
