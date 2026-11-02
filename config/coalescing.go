@@ -12,7 +12,7 @@ func (c *Config) coalescingFields() []struct {
 		value              *int
 		fallback, min, max int
 	}{
-		{"cache.range_block_bytes", &c.RangeBlockBytes, 1 << 20, 64 << 10, 8 << 20},
+		{"cache.range_block_bytes", &c.RangeBlockBytes, 1 << 20, 1 << 20, 1 << 20},
 		{"cache.shared_fill_public_static", &c.SharedFillPublicStatic, 0, 0, 1},
 		{"cache.shared_fill_max_tasks", &c.SharedFillMaxTasks, 16, 1, 1000000},
 		{"cache.shared_fill_max_waiters", &c.SharedFillMaxWaiters, 256, 1, 1000000},

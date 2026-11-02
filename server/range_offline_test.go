@@ -224,7 +224,7 @@ func TestRangeCorruptCacheFailsSafelyOfflineAfterRestart(t *testing.T) {
 			}
 			needle := []byte("offline-corruption-payload-")
 			if record == "manifest" {
-				needle = []byte(`"Version":2,"BlockSize":1048576`)
+				needle = []byte(`"Version":3,"ChunkBytes":1048576`)
 			}
 			buf := make([]byte, 64<<10)
 			found := false

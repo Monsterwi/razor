@@ -7,13 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"sync"
 )
 
 // Cache is the main entry point, managing multiple stripes (volumes).
 // It roughly corresponds to Cache.cc / CacheProcessor in ATS.
 type Cache struct {
-	Stripes []*Stripe
-	Scheme  string // e.g. "http"
+	partialLocks [64]sync.Mutex
+	Stripes      []*Stripe
+	Scheme       string // e.g. "http"
 }
 
 // NewCache creates a new Cache with nStripes.

@@ -41,7 +41,7 @@
 
 ## 配置与回归
 
-`proxy.config.cache.range_block_bytes` 默认 1 MiB，允许 64 KiB–8 MiB 的 2 次幂，重启生效。小块减少首块等待与区间放大，增加元数据和源站请求。
+Plan A 固定每个 chunk 为 1 MiB、每个 segment 包含 64 个 chunk。兼容配置项 `proxy.config.cache.range_block_bytes` 仅接受 1048576；其他值拒绝加载。
 
 代码：[serveBlocks](../server/range_cache.go)。回归：[首块屏障/共享](../server/rww_test.go)、[淘汰](../server/rww_eviction_test.go)、[版本围栏](../server/range_version_fence_test.go)。
 

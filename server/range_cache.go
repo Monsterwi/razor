@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -20,30 +19,20 @@ import (
 	"github.com/Monsterwi/razor/proxy"
 )
 
-const rangeLayoutVersion = 2
+const rangeLayoutVersion = cache.PartialFormatVersion
 
 var errRangeBypass = errors.New("range representation unsupported")
 var errRangeChanged = errors.New("range representation changed")
 var errRangeUnavailable = errors.New("range origin unavailable")
 var errRangeOwnership = errors.New("range object writer unavailable")
 
-type rangePreparation struct {
-	reused bool
-	err    error
-}
-
-type rangeManifest struct {
-	Version                            int
-	BlockSize                          int64
-	Total                              int64
-	ETag, Origin, Variant, Incarnation string
-}
+type rangeObject = cache.PartialObject
 
 func rangeEligible(r *http.Request) bool {
 	if r.Method != http.MethodGet || len(r.Header.Values("Range")) != 1 || !strings.HasPrefix(r.Header.Get("Range"), "bytes=") || strings.Contains(r.Header.Get("Range"), ",") {
 		return false
 	}
-	for _, name := range []string{"If-Match", "If-Unmodified-Since", "If-None-Match", "If-Modified-Since"} {
+	for _, name := range []string{"If-Range", "If-Match", "If-Unmodified-Since", "If-None-Match", "If-Modified-Since"} {
 		if hasHeader(r.Header, name) {
 			return false
 		}
@@ -62,57 +51,40 @@ func rangeEligible(r *http.Request) bool {
 
 func rangeIdentity(root []byte, origin *proxy.Origin, r *http.Request) ([]byte, string) {
 	variant, _ := json.Marshal(struct{ Encoding, Language []string }{r.Header.Values("Accept-Encoding"), r.Header.Values("Accept-Language")})
-	return rangeManifestKey(root, origin.Identity(), string(variant), int64(requestRuntime(r).config.RangeBlockBytes)), string(variant)
+	return rangeObjectKey(root, origin.Identity(), string(variant), int64(requestRuntime(r).config.RangeBlockBytes)), string(variant)
 }
-func rangeManifestKey(root []byte, origin, variant string, size int64) []byte {
-	hash := sha256.Sum256([]byte(origin + "\x00" + variant))
-	return []byte(fmt.Sprintf("%s\nrange:manifest:v%d:%d:%x", root, rangeLayoutVersion, size, hash))
+func rangeObjectKey(root []byte, origin, variant string, size int64) []byte {
+	return cache.PartialObjectKey(root, origin, variant)
 }
-func rangeBlockKey(root []byte, m *rangeManifest, index int64) []byte {
-	hash := sha256.Sum256([]byte(m.Origin + "\x00" + m.Variant + "\x00" + m.ETag + "\x00" + m.Incarnation + fmt.Sprintf(":%d:%d", m.Version, m.BlockSize)))
-	return []byte(fmt.Sprintf("%s\nrange:block:%x:%d", root, hash, index))
-}
+func rangeBlockKey(root []byte, m *rangeObject, index int64) []byte { return m.ChunkKey(root, index) }
 
-func (s *Server) readRangeManifest(r *http.Request, key []byte, origin, variant string, size int64) (*rangeManifest, *cache.CacheHTTPInfo, error) {
+func (s *Server) readRangeObject(r *http.Request, key []byte, origin, variant string, size int64) (*rangeObject, *cache.CacheHTTPInfo, error) {
 	rt := requestRuntime(r)
 	release, err := rt.rangeReaders.Acquire(r.Context(), time.Duration(rt.config.QueueTimeout)*time.Second)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer release()
-	return s.readRangeManifestData(key, origin, variant, size)
+	return s.readRangeObjectData(key, origin, variant, size)
 }
 
 // Caller holds a reader or writer reservation, including bounded fragment scratch.
-func (s *Server) readRangeManifestData(key []byte, origin, variant string, size int64) (*rangeManifest, *cache.CacheHTTPInfo, error) {
-	vc, err := s.cache.OpenReadCommitted(key)
-	if err != nil {
-		return nil, nil, err
+func (s *Server) readRangeObjectData(key []byte, origin, variant string, size int64) (*rangeObject, *cache.CacheHTTPInfo, error) {
+	m, info, err := s.cache.ReadPartialObject(key, origin, variant)
+	if err == nil && !strongRangeTag(m.ETag) {
+		return nil, nil, errRangeBypass
 	}
-	defer vc.Close()
-	info, err := vc.LoadHTTPInfo()
-	if err != nil {
-		return nil, nil, err
-	}
-	data, err := io.ReadAll(io.LimitReader(vc, (64<<10)+1))
-	if err != nil || len(data) > 64<<10 {
-		return nil, nil, errors.New("invalid range manifest")
-	}
-	var m rangeManifest
-	if json.Unmarshal(data, &m) != nil || m.Version != rangeLayoutVersion || m.BlockSize != size || m.Total < 0 || !strongRangeTag(m.ETag) || m.Origin != origin || m.Variant != variant || len(m.Incarnation) != 32 {
-		return nil, nil, errors.New("invalid range manifest")
-	}
-	return &m, info, nil
+	return m, info, err
 }
 
-// A missing/evicted manifest is unknown, not a new version; fixed ETag block
+// Missing object metadata is unknown, not a new version; fixed ETag block
 // validation still protects streaming through a cache smaller than the object.
-func (s *Server) checkRangeVersion(root []byte, parent *cache.FillToken, m *rangeManifest) error {
+func (s *Server) checkRangeVersion(root []byte, parent *cache.FillToken, m *rangeObject) error {
 	if err := s.cache.CheckFill(parent); err != nil {
 		return err
 	}
-	key := rangeManifestKey(root, m.Origin, m.Variant, m.BlockSize)
-	current, _, err := s.readRangeManifestData(key, m.Origin, m.Variant, m.BlockSize)
+	key := rangeObjectKey(root, m.Origin, m.Variant, m.ChunkBytes)
+	current, _, err := s.readRangeObjectData(key, m.Origin, m.Variant, m.ChunkBytes)
 	if err == nil && (current.ETag != m.ETag || current.Total != m.Total) {
 		return errRangeChanged
 	}
@@ -126,7 +98,7 @@ func identityEncoding(h http.Header) bool {
 
 // rangeFill shares the existing bounded coordinator; every reader opens its own
 // complete committed object, and detached producers retain their own resources.
-func (s *Server) rangeFill(r *http.Request, key []byte, token *cache.FillToken, prefetch bool, produce func(*fillTask, *http.Request, fillResources) fillResult) error {
+func (s *Server) startRangeFill(r *http.Request, key []byte, token *cache.FillToken, prefetch bool, produce func(*fillTask, *http.Request, fillResources) fillResult) (*fillTask, func(), error) {
 	resources := s.captureFillResources(r)
 	if resources.config.SharedFillPublicStatic == 1 {
 		r = resources.proxy.NormalizePublicRequest(r)
@@ -137,9 +109,8 @@ func (s *Server) rangeFill(r *http.Request, key []byte, token *cache.FillToken, 
 	task, creator, err := s.fills.join(fillIdentity(identity, key, resources.version), token, resources.config)
 	if err != nil {
 		resources.release()
-		return err
+		return nil, nil, err
 	}
-	defer s.fills.leave(task, creator)
 	if creator {
 		request := withRequestRuntime(r, task.ctx, resources.runtime)
 		go func() {
@@ -168,6 +139,15 @@ func (s *Server) rangeFill(r *http.Request, key []byte, token *cache.FillToken, 
 	} else {
 		resources.release()
 	}
+	return task, func() { s.fills.leave(task, creator) }, nil
+}
+
+func (s *Server) rangeFill(r *http.Request, key []byte, token *cache.FillToken, prefetch bool, produce func(*fillTask, *http.Request, fillResources) fillResult) error {
+	task, leave, err := s.startRangeFill(r, key, token, prefetch, produce)
+	if err != nil {
+		return err
+	}
+	defer leave()
 	select {
 	case <-r.Context().Done():
 		return r.Context().Err()
@@ -217,8 +197,8 @@ func (s *Server) writeRangeObject(task *fillTask, fill *cacheFill, info *cache.C
 	return fill.commit()
 }
 
-func (s *Server) ensureRangeManifest(r *http.Request, root, key []byte, parent *cache.FillToken, origin *proxy.Origin, variant string) (*rangeManifest, *cache.CacheHTTPInfo, bool, error) {
-	if m, info, err := s.readRangeManifest(r, key, origin.Identity(), variant, int64(requestRuntime(r).config.RangeBlockBytes)); err == nil && requestFresh(r, info, s.now()) {
+func (s *Server) ensureRangeObject(r *http.Request, root, key []byte, parent *cache.FillToken, origin *proxy.Origin, variant string) (*rangeObject, *cache.CacheHTTPInfo, bool, error) {
+	if m, info, err := s.readRangeObject(r, key, origin.Identity(), variant, int64(requestRuntime(r).config.RangeBlockBytes)); err == nil && requestFresh(r, info, s.now()) {
 		return m, info, true, nil
 	}
 	token, err := s.cache.DeriveFill(parent, key)
@@ -226,7 +206,7 @@ func (s *Server) ensureRangeManifest(r *http.Request, root, key []byte, parent *
 		return nil, nil, false, err
 	}
 	err = s.rangeFill(r, key, token, false, func(task *fillTask, request *http.Request, resources fillResources) fillResult {
-		previous, metadata, readErr := s.readRangeManifest(request, key, origin.Identity(), variant, int64(requestRuntime(r).config.RangeBlockBytes))
+		previous, metadata, readErr := s.readRangeObject(request, key, origin.Identity(), variant, int64(requestRuntime(r).config.RangeBlockBytes))
 		if readErr == nil && requestFresh(request, metadata, s.now()) {
 			return fillResult{key: key}
 		}
@@ -263,12 +243,12 @@ func (s *Server) ensureRangeManifest(r *http.Request, root, key []byte, parent *
 		if _, err = rand.Read(incarnation[:]); err != nil {
 			return fillResult{err: err}
 		}
-		m := rangeManifest{Version: rangeLayoutVersion, BlockSize: int64(resources.config.RangeBlockBytes), Total: resp.RawResponse.ContentLength, ETag: headers.Get("ETag"), Origin: origin.Identity(), Variant: variant, Incarnation: hex.EncodeToString(incarnation[:])}
+		m := rangeObject{Version: rangeLayoutVersion, ChunkBytes: int64(resources.config.RangeBlockBytes), Total: resp.RawResponse.ContentLength, ETag: headers.Get("ETag"), Origin: origin.Identity(), Variant: variant, Generation: hex.EncodeToString(incarnation[:])}
 		// A strong validator identifies unchanged content across freshness refreshes.
 		if readErr == nil && previous.ETag == m.ETag && previous.Total == m.Total {
-			m.Incarnation = previous.Incarnation
+			m.Generation = previous.Generation
 		}
-		encoded, err := json.Marshal(m)
+		encoded, err := m.MarshalBinary()
 		if err != nil || len(encoded) > 64<<10 {
 			return fillResult{err: errRangeBypass}
 		}
@@ -279,7 +259,7 @@ func (s *Server) ensureRangeManifest(r *http.Request, root, key []byte, parent *
 	if err != nil {
 		return nil, nil, false, err
 	}
-	m, info, err := s.readRangeManifest(r, key, origin.Identity(), variant, int64(requestRuntime(r).config.RangeBlockBytes))
+	m, info, err := s.readRangeObject(r, key, origin.Identity(), variant, int64(requestRuntime(r).config.RangeBlockBytes))
 	return m, info, false, err
 }
 
@@ -322,7 +302,7 @@ func rangeBounds(value string, total int64) (int64, int64, error) {
 	return start, end, nil
 }
 
-func (s *Server) readRangeBlock(r *http.Request, key []byte, m *rangeManifest, index int64, prefetch bool) ([]byte, *cache.CacheHTTPInfo, func(), error) {
+func (s *Server) readRangeBlock(r *http.Request, key []byte, m *rangeObject, index int64, prefetch bool) ([]byte, *cache.CacheHTTPInfo, func(), error) {
 	rt := requestRuntime(r)
 	var release func()
 	var err error
@@ -342,36 +322,7 @@ func (s *Server) readRangeBlock(r *http.Request, key []byte, m *rangeManifest, i
 	return data, info, release, nil
 }
 
-// Preparation does not pin directory entries while another reader rolls the disk.
-func (s *Server) readPreparedRangeBlock(r *http.Request, root []byte, parent *cache.FillToken, m *rangeManifest, index int64, origin *proxy.Origin, reused bool) ([]byte, func(), bool, error) {
-	data, _, release, err := s.readRangeBlock(r, rangeBlockKey(root, m, index), m, index, false)
-	if errors.Is(err, cache.ErrNotResident) || errors.Is(err, cache.ErrWriteInProgress) {
-		// The failed read has released its reservation. Check the original URL
-		// fence and any observed version change before recovering the fixed block.
-		rt := requestRuntime(r)
-		releaseGuard, guardErr := rt.rangeReaders.Acquire(r.Context(), time.Duration(rt.config.QueueTimeout)*time.Second)
-		if guardErr != nil {
-			return nil, release, false, guardErr
-		}
-		guardErr = s.checkRangeVersion(root, parent, m)
-		releaseGuard()
-		if guardErr != nil {
-			return nil, release, false, guardErr
-		}
-		reused = false
-		_, err = s.ensureRangeBlock(r, root, parent, m, index, origin, false)
-		if err == nil {
-			data, _, release, err = s.readRangeBlock(r, rangeBlockKey(root, m, index), m, index, false)
-		}
-	}
-	return data, release, reused, err
-}
-func (s *Server) rangeBlockCached(r *http.Request, key []byte, m *rangeManifest, index int64) bool {
-	_, info, release, err := s.readRangeBlock(r, key, m, index, false)
-	release()
-	return err == nil && s.rangeBlockFresh(r, info)
-}
-func (s *Server) readRangeBlockData(key []byte, m *rangeManifest, index int64) ([]byte, *cache.CacheHTTPInfo, error) {
+func (s *Server) readRangeBlockData(key []byte, m *rangeObject, index int64) ([]byte, *cache.CacheHTTPInfo, error) {
 	vc, err := s.cache.OpenReadCommitted(key)
 	if err != nil {
 		return nil, nil, err
@@ -381,7 +332,7 @@ func (s *Server) readRangeBlockData(key []byte, m *rangeManifest, index int64) (
 	if err != nil {
 		return nil, nil, err
 	}
-	size := min(m.BlockSize, m.Total-index*m.BlockSize)
+	size := min(m.ChunkBytes, m.Total-index*m.ChunkBytes)
 	if info.Status != http.StatusPartialContent || info.ResponseHeaders.Get("ETag") != m.ETag {
 		return nil, nil, errRangeChanged
 	}
@@ -402,35 +353,65 @@ func (s *Server) rangeBlockFresh(r *http.Request, info *cache.CacheHTTPInfo) boo
 	return requestFresh(r, &normal, s.now())
 }
 
-func (s *Server) invalidateRange(r *http.Request, root []byte, parent *cache.FillToken, m *rangeManifest) {
-	key := rangeManifestKey(root, m.Origin, m.Variant, m.BlockSize)
+func (s *Server) invalidateRange(r *http.Request, root []byte, parent *cache.FillToken, m *rangeObject) {
+	key := rangeObjectKey(root, m.Origin, m.Variant, m.ChunkBytes)
 	token, err := s.cache.DeriveFill(parent, key)
 	if err == nil {
-		current, _, err := s.readRangeManifest(r, key, m.Origin, m.Variant, m.BlockSize)
-		if err == nil && current.Incarnation == m.Incarnation {
+		current, _, err := s.readRangeObject(r, key, m.Origin, m.Variant, m.ChunkBytes)
+		if err == nil && current.Generation == m.Generation {
 			_ = s.cache.InvalidateFill(token)
 		}
 	}
 	_ = s.cache.InvalidateFill(parent)
 }
 
-func (s *Server) ensureRangeBlock(r *http.Request, root []byte, parent *cache.FillToken, m *rangeManifest, index int64, origin *proxy.Origin, prefetch bool) (bool, error) {
-	key := rangeBlockKey(root, m, index)
-	_, cachedInfo, release, readErr := s.readRangeBlock(r, key, m, index, prefetch)
-	release()
-	if readErr == nil && s.rangeBlockFresh(r, cachedInfo) {
-		return true, nil
+type rangeSubscription struct {
+	body   io.Reader
+	close  func()
+	wait   func() error
+	reused bool
+}
+
+func (s *Server) readRangeCoverage(r *http.Request, root []byte, m *rangeObject, segment int64) (cache.PartialCoverage, error) {
+	rt := requestRuntime(r)
+	release, err := rt.rangeReaders.Acquire(r.Context(), time.Duration(rt.config.QueueTimeout)*time.Second)
+	if err != nil {
+		return cache.PartialCoverage{}, err
 	}
+	defer release()
+	return s.cache.PartialCoverage(root, m, segment)
+}
+
+func (s *Server) openRangeBlock(r *http.Request, root []byte, parent *cache.FillToken, m *rangeObject, index int64, origin *proxy.Origin, prefetch bool) (*rangeSubscription, error) {
+	key := rangeBlockKey(root, m, index)
+	coverage, _ := s.readRangeCoverage(r, root, m, index/cache.PartialSegmentChunks)
+	var data []byte
+	var cachedInfo *cache.CacheHTTPInfo
+	release := func() {}
+	readErr := cache.ErrNotResident
+	if coverage.Bits&(uint64(1)<<uint(index%cache.PartialSegmentChunks)) != 0 {
+		data, cachedInfo, release, readErr = s.readRangeBlock(r, key, m, index, prefetch)
+	}
+	if readErr == nil && s.rangeBlockFresh(r, cachedInfo) {
+		return &rangeSubscription{body: bytes.NewReader(data), close: release, wait: func() error { return nil }, reused: true}, nil
+	}
+	release()
 	if prefetch && errors.Is(readErr, budget.ErrOverloaded) {
-		return false, readErr
+		return nil, readErr
+	}
+	if err := s.checkRangeVersion(root, parent, m); err != nil {
+		return nil, err
 	}
 	token, err := s.cache.DeriveFill(parent, key)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	err = s.rangeFill(r, key, token, prefetch, func(task *fillTask, request *http.Request, resources fillResources) fillResult {
-		if _, info, err := s.readRangeBlockData(key, m, index); err == nil && s.rangeBlockFresh(request, info) {
-			return fillResult{key: key}
+	task, leave, err := s.startRangeFill(r, key, token, prefetch, func(task *fillTask, request *http.Request, resources fillResources) fillResult {
+		coverage, _ := s.cache.PartialCoverage(root, m, index/cache.PartialSegmentChunks)
+		if coverage.Bits&(uint64(1)<<uint(index%cache.PartialSegmentChunks)) != 0 {
+			if _, info, err := s.readRangeBlockData(key, m, index); err == nil && s.rangeBlockFresh(request, info) {
+				return fillResult{key: key}
+			}
 		}
 		if !origin.Available() {
 			return fillResult{err: errRangeUnavailable}
@@ -440,8 +421,8 @@ func (s *Server) ensureRangeBlock(r *http.Request, root []byte, parent *cache.Fi
 			return fillResult{err: err}
 		}
 		defer fill.abort(errors.New("incomplete range object"))
-		start := index * m.BlockSize
-		end := min(start+m.BlockSize, m.Total) - 1
+		start := index * m.ChunkBytes
+		end := min(start+m.ChunkBytes, m.Total) - 1
 		request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 		request.Header.Del("If-Range")
 		request.Header.Set("If-Match", m.ETag)
@@ -454,7 +435,7 @@ func (s *Server) ensureRangeBlock(r *http.Request, root []byte, parent *cache.Fi
 		defer resp.RawBody().Close()
 		if resp.StatusCode() != 206 || headers.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", start, end, m.Total) || len(headers.Values("Content-Range")) != 1 || headers.Get("ETag") != m.ETag || len(headers.Values("ETag")) != 1 || resp.RawResponse.ContentLength != end-start+1 || !identityEncoding(headers) || len(resp.RawResponse.Trailer) != 0 {
 			s.invalidateRange(request, root, parent, m)
-			if resp.StatusCode() == 200 {
+			if resp.StatusCode() == 200 && headers.Get("ETag") == m.ETag && resp.RawResponse.ContentLength == m.Total {
 				return fillResult{err: errRangeBypass}
 			}
 			return fillResult{err: errRangeChanged}
@@ -470,31 +451,69 @@ func (s *Server) ensureRangeBlock(r *http.Request, root []byte, parent *cache.Fi
 		}
 		info.Status = 206
 		info.ResponseHeaders = resp.Header().Clone()
-		// Buffer one block so length/trailer validation completes before publication.
-		data, err := readExactRange(resp.RawBody(), end-start+1)
-		if err != nil {
-			return fillResult{err: err}
+		fill.vc.SetHTTPInfo(info)
+		task.publishStream(fill.vc)
+		err = s.writeRangeObject(task, fill, info, resp.RawBody(), end-start+1)
+		if err == nil {
+			err = s.cache.PublishPartialChunk(task.ctx, parent, root, m, index, info)
 		}
-		if int64(len(data)) != end-start+1 || len(resp.RawResponse.Trailer) != 0 {
-			return fillResult{err: io.ErrUnexpectedEOF}
-		}
-		if err = s.checkRangeVersion(root, parent, m); err != nil {
-			return fillResult{err: err}
-		}
-		err = s.writeRangeObject(task, fill, info, bytes.NewReader(data), int64(len(data)))
 		return fillResult{key: key, err: err}
 	})
-	return false, err
+	if err != nil {
+		return nil, err
+	}
+	wait := func() error {
+		select {
+		case <-r.Context().Done():
+			return r.Context().Err()
+		case <-task.done:
+			return task.result.err
+		}
+	}
+	streaming := false
+	select {
+	case <-r.Context().Done():
+		leave()
+		return nil, r.Context().Err()
+	case <-task.streamReady:
+		streaming = true
+	case <-task.done:
+	}
+	if !streaming {
+		if task.result.err != nil {
+			leave()
+			return nil, task.result.err
+		}
+		data, _, release, err := s.readRangeBlock(r, key, m, index, prefetch)
+		if err != nil {
+			leave()
+			return nil, err
+		}
+		return &rangeSubscription{body: bytes.NewReader(data), close: func() { release(); leave() }, wait: wait}, nil
+	}
+	rt := requestRuntime(r)
+	releaseReader, err := rt.rangeReaders.Acquire(r.Context(), time.Duration(rt.config.QueueTimeout)*time.Second)
+	if err != nil {
+		leave()
+		return nil, err
+	}
+	reader, err := task.stream.OpenReader(r.Context())
+	if err != nil {
+		releaseReader()
+		leave()
+		return nil, err
+	}
+	return &rangeSubscription{body: reader, close: func() { reader.Close(); releaseReader(); leave() }, wait: wait}, nil
 }
 
-func (s *Server) rangeFits(root []byte, m *rangeManifest, start, end int64) bool {
+func (s *Server) rangeFits(root []byte, m *rangeObject, start, end int64) bool {
 	required := make(map[*cache.Stripe]int64, 2)
-	for index := start / m.BlockSize; index <= min(start/m.BlockSize+1, end/m.BlockSize); index++ {
+	for index := start / m.ChunkBytes; index <= min(start/m.ChunkBytes+1, end/m.ChunkBytes); index++ {
 		stripe := s.cache.KeyToStripe(rangeBlockKey(root, m, index))
 		if stripe == nil {
 			return false
 		}
-		required[stripe] += min(m.BlockSize, m.Total-index*m.BlockSize) + (64 << 10)
+		required[stripe] += min(m.ChunkBytes, m.Total-index*m.ChunkBytes) + (64 << 10)
 		if required[stripe]+(1<<20) > stripe.Skip+stripe.Len-stripe.Start {
 			return false
 		}
@@ -532,19 +551,18 @@ func (s *Server) serveBlocks(w http.ResponseWriter, r *http.Request, root []byte
 		return true
 	}
 	var origin *proxy.Origin
-	var m *rangeManifest
+	var m *rangeObject
 	var info *cache.CacheHTTPInfo
-	cachedReady := false
 	// Prefer a healthy source; an unhealthy source is usable only for a complete
 	// fresh interval. Pin one source before sending, never stitch replicas.
 	for _, candidate := range resources.proxy.ConfiguredOrigins() {
 		key, variant := rangeIdentity(root, candidate, r)
-		cached, metadata, readErr := s.readRangeManifest(r, key, candidate.Identity(), variant, int64(resources.config.RangeBlockBytes))
+		cached, metadata, readErr := s.readRangeObject(r, key, candidate.Identity(), variant, int64(resources.config.RangeBlockBytes))
 		if readErr != nil || !requestFresh(r, metadata, s.now()) {
 			continue
 		}
 		if candidate.Available() {
-			origin, m, info, cachedReady = candidate, cached, metadata, false
+			origin, m, info = candidate, cached, metadata
 			break
 		}
 		if origin != nil {
@@ -556,15 +574,19 @@ func (s *Server) serveBlocks(w http.ResponseWriter, r *http.Request, root []byte
 		start, end, boundsErr := requestedBlockBounds(r, cached.Total, full)
 		complete := true
 		if boundsErr == nil {
-			for index := start / cached.BlockSize; index <= end/cached.BlockSize; index++ {
-				if !s.rangeBlockCached(r, rangeBlockKey(root, cached, index), cached, index) {
+			for segment := start / cached.ChunkBytes / cache.PartialSegmentChunks; segment <= end/cached.ChunkBytes/cache.PartialSegmentChunks; segment++ {
+				coverage, _ := s.readRangeCoverage(r, root, cached, segment)
+				low := max(start/cached.ChunkBytes-segment*cache.PartialSegmentChunks, int64(0))
+				high := min(end/cached.ChunkBytes-segment*cache.PartialSegmentChunks, int64(63))
+				mask := (^uint64(0) << uint(low)) & (^uint64(0) >> uint(63-high))
+				if coverage.Bits&mask != mask {
 					complete = false
 					break
 				}
 			}
 		}
 		if complete {
-			origin, m, info, cachedReady = candidate, cached, metadata, true
+			origin, m, info = candidate, cached, metadata
 		}
 	}
 	hit := m != nil
@@ -575,7 +597,7 @@ func (s *Server) serveBlocks(w http.ResponseWriter, r *http.Request, root []byte
 			return true
 		}
 		key, variant := rangeIdentity(root, origin, r)
-		m, info, hit, err = s.ensureRangeManifest(r, root, key, parent, origin, variant)
+		m, info, hit, err = s.ensureRangeObject(r, root, key, parent, origin, variant)
 	}
 	if errors.Is(err, errRangeBypass) {
 		if full {
@@ -591,7 +613,7 @@ func (s *Server) serveBlocks(w http.ResponseWriter, r *http.Request, root []byte
 		s.upstreamError(w, r, err)
 		return true
 	}
-	if full && m.Total <= max(int64(1<<20), m.BlockSize) {
+	if full && m.Total <= max(int64(1<<20), m.ChunkBytes) {
 		return false
 	}
 	if value := r.Header.Get("If-Range"); value != "" && (!strongRangeTag(value) || value != m.ETag) {
@@ -611,27 +633,22 @@ func (s *Server) serveBlocks(w http.ResponseWriter, r *http.Request, root []byte
 		http.Error(w, "Range exceeds cache capacity", http.StatusServiceUnavailable)
 		return true
 	}
-	first := start / m.BlockSize
-	blockReused := cachedReady
-	if !cachedReady {
-		reused, fillErr := s.ensureRangeBlock(r, root, parent, m, first, origin, false)
-		blockReused = reused
-		hit = hit && reused
-		if errors.Is(fillErr, errRangeBypass) {
-			s.proxyRangeBypass(w, r, origin)
-			return true
-		}
-		if fillErr != nil {
-			s.upstreamError(w, r, fillErr)
-			return true
-		}
+	first := start / m.ChunkBytes
+	sub, err := s.openRangeBlock(r, root, parent, m, first, origin, false)
+	if errors.Is(err, errRangeBypass) {
+		s.proxyRangeBypass(w, r, origin)
+		return true
 	}
-	data, releaseBlock, blockReused, err := s.readPreparedRangeBlock(r, root, parent, m, first, origin, blockReused)
-	defer func() { releaseBlock() }()
 	if err != nil {
 		s.upstreamError(w, r, err)
 		return true
 	}
+	defer func() {
+		if sub != nil {
+			sub.close()
+		}
+	}()
+	blockReused := sub.reused
 
 	hit = hit && blockReused
 	if err = s.checkRangeVersion(root, parent, m); err != nil {
@@ -664,70 +681,48 @@ func (s *Server) serveBlocks(w http.ResponseWriter, r *http.Request, root []byte
 	} else {
 		w.WriteHeader(http.StatusPartialContent)
 	}
-	ctx, cancel := context.WithCancel(r.Context())
-	prefetchRequest := withRequestRuntime(r, ctx, resources.runtime)
-	var next chan rangePreparation
-	defer func() {
-		cancel()
-		if next != nil {
-			<-next
-		}
-	}()
-	for index := first; index <= end/m.BlockSize; index++ {
+	for index := first; index <= end/m.ChunkBytes; index++ {
 		if index != first {
-			if !s.rangeFits(root, m, index*m.BlockSize, end) {
-				panic(http.ErrAbortHandler)
-			}
-			if !cachedReady {
-				if next != nil {
-					prepared := <-next
-					err = prepared.err
-					blockReused = prepared.reused
-					next = nil
-				} else {
-					blockReused, err = s.ensureRangeBlock(r, root, parent, m, index, origin, false)
-				}
-				if errors.Is(err, budget.ErrOverloaded) {
-					blockReused, err = s.ensureRangeBlock(r, root, parent, m, index, origin, false)
-				}
-				if err != nil {
-					panic(http.ErrAbortHandler)
-				}
-				hit = hit && blockReused
-			}
-			data, releaseBlock, blockReused, err = s.readPreparedRangeBlock(r, root, parent, m, index, origin, blockReused)
+			sub, err = s.openRangeBlock(r, root, parent, m, index, origin, false)
 			if err != nil {
 				panic(http.ErrAbortHandler)
 			}
 		}
-		hit = hit && blockReused
+		hit = hit && sub.reused
 		if s.checkRangeVersion(root, parent, m) != nil {
 			panic(http.ErrAbortHandler)
 		}
-		if !cachedReady && index < end/m.BlockSize {
-			next = make(chan rangePreparation, 1)
-			result := next
-			go func(index int64) {
-				reused, err := s.ensureRangeBlock(prefetchRequest, root, parent, m, index, origin, true)
-				result <- rangePreparation{reused, err}
-			}(index + 1)
-		}
-		low := max(start-index*m.BlockSize, int64(0))
-		high := min(end-index*m.BlockSize+1, int64(len(data)))
-		if blockReused {
+		low := max(start-index*m.ChunkBytes, int64(0))
+		high := min(end-index*m.ChunkBytes+1, min(m.ChunkBytes, m.Total-index*m.ChunkBytes))
+		if sub.reused {
 			s.counters.rangeHits.Add(1)
 			s.counters.rangeHitBytes.Add(uint64(high - low))
 		} else {
 			s.counters.rangeMisses.Add(1)
 			s.counters.rangeMissBytes.Add(uint64(high - low))
 		}
-		if err = s.streamResponse(w, bytes.NewReader(data[low:high]), r); err != nil {
+		if _, err = io.CopyN(io.Discard, sub.body, low); err != nil {
 			panic(http.ErrAbortHandler)
 		}
-		data = nil
-		releaseBlock()
-		releaseBlock = func() {}
+		// Hold the last byte until validation so normal client completion cannot cancel the aligned fill.
+		limited := &io.LimitedReader{R: sub.body, N: high - low - 1}
+		if err = s.streamResponse(w, limited, r); err != nil || limited.N != 0 {
+			panic(http.ErrAbortHandler)
+		}
+		var last [1]byte
+		if _, err = io.ReadFull(sub.body, last[:]); err != nil {
+			panic(http.ErrAbortHandler)
+		}
+		if err = sub.wait(); err != nil {
+			panic(http.ErrAbortHandler)
+		}
+		if err = s.streamResponse(w, bytes.NewReader(last[:]), r); err != nil {
+			panic(http.ErrAbortHandler)
+		}
+		sub.close()
+		sub = nil
 	}
+
 	complete = true
 	return true
 }
