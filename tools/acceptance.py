@@ -511,6 +511,7 @@ class Client:
             values = sorted(r[key] for r in rows if r[key] is not None)
             return {"p" + str(q): values[max(0, math.ceil(len(values) * q / 100) - 1)] for q in (50, 95, 99)}
         summary = {"name": name, "product": product.kind, "concurrency": concurrency, "requests": len(rows),
+                   "response_body_bytes": payload,
                    "seconds": elapsed, "requests_per_second": len(rows) / elapsed,
                    "mib_per_second": payload / MIB / elapsed, "ttfb_ms": quantiles("ttfb_ms"),
                    "completion_ms": quantiles("completion_ms"), "unexpected_errors": len(errors),
@@ -526,6 +527,7 @@ class Client:
                                                   for field in ("InFlight", "CacheWriters", "BufferReserved", "SharedFillTasks", "SharedFillWaiters")}
                                                   if product.kind == "razor" else None,
                    "resource_samples": samples}
+        summary["origin_body_bytes_per_response_byte"] = summary["origin"]["bytes"] / payload if payload else None
         if product.kind == "razor":
             from public_acceptance import counter_metrics, snapshot
             structured_after = snapshot(product)

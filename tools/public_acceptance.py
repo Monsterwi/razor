@@ -491,6 +491,17 @@ def public_benchmark(args, fixtures, output):
         product = Product("razor", output / "public-benchmark", origin, args)
         cleanup.callback(product.stop)
         for repeat in range(args.repeats):
+            for length in (1, 4096):
+                path = f"/large-range-{length}-r{repeat + 1}"
+                bounds = (123, 123 + length - 1)
+                headers = {"Range": f"bytes={bounds[0]}-{bounds[1]}"}
+                cold = client.batch(product, origin, f"range-{length}-cold-r{repeat + 1}", path, 1,
+                                    count=1, bounds=bounds, headers=headers)
+                assert cold["origin"] == {"requests": 2, "get": 1, "head": 1, "bytes": MIB}, cold
+                assert cold["response_body_bytes"] == length, cold
+                hot = client.batch(product, origin, f"range-{length}-hot-r{repeat + 1}", path, 1,
+                                   count=1, duration=args.seconds, bounds=bounds, headers=headers)
+                assert hot["origin"]["requests"] == 0 and hot["origin"]["bytes"] == 0, hot
             for size, steps in (("small", (1, 8, 32, 100)), ("large", (1, 8, 32))):
                 hot = f"/{size}-hot-public"
                 client.checked(product, hot)

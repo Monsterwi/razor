@@ -185,10 +185,13 @@ class WorkloadTest(unittest.TestCase):
                                  paths=["/small-mixed", "/large-mixed"])
             self.assertEqual(mixed["object_requests"], {"small": 1, "large": 1})
             self.assertEqual(mixed["unexpected_errors"], 0)
+            self.assertEqual(mixed["response_body_bytes"], (256 << 10) + acceptance.CHUNK + 17)
+            self.assertEqual(mixed["origin_body_bytes_per_response_byte"], 1)
             unique = client.batch(product, origin, "unique", "/small-unique", 2, count=2, unique_paths=True)
             self.assertEqual(unique["origin"]["get"], 4)
             self.assertEqual(len({row["path"] for row in origin.records if "unique" in row["path"]}), 4)
             self.assertEqual(unique["unexpected_errors"], 0)
+            self.assertEqual(unique["response_body_bytes"], 1 << 20)
 
 
 if __name__ == "__main__":
