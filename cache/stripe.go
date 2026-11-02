@@ -201,6 +201,7 @@ func (s *Stripe) failLocked(err error) error {
 	if err != nil && s.storageErr == nil {
 		s.storageErr = err
 		s.AggBuffer.Fail(err)
+		s.evacCancel()
 	}
 	return s.storageErr
 }

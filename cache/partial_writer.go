@@ -30,6 +30,7 @@ func (c *Cache) OpenWritePartialChunk(ctx context.Context, parent *FillToken, ke
 		vc, err := c.openWriteFillKeyReplacingLocked(ctx, token, key, nil)
 		if err == nil {
 			vc.writer.chunkLength = length
+			vc.writer.watchStorage()
 		}
 		return vc, err
 	}
@@ -53,5 +54,17 @@ func (c *Cache) OpenWritePartialChunk(ctx context.Context, parent *FillToken, ke
 	}
 	w.purged.Store(true)
 	w.od = NewOpenDirEntry(w)
+	w.watchStorage()
 	return &CacheVC{Stripe: s, Key: append([]byte(nil), key...), writing: true, writer: w, entry: w.od, generation: w.generation}, nil
+}
+
+func (w *CacheWriter) watchStorage() {
+	// A purged stream is absent from OpenDir but must still wake on terminal I/O.
+	w.stopStorageWatch = context.AfterFunc(w.Stripe.evacCtx, func() {
+		err := w.Stripe.writeError()
+		if err == nil {
+			err = ErrCacheClosed
+		}
+		w.Abort(err)
+	})
 }

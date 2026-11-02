@@ -10,7 +10,72 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
+
+func TestPurgedPartialHeaderWaiterStopsWhenCacheCloses(t *testing.T) {
+	c, m, root, parent, _ := partialFixture(t)
+	w, err := c.OpenWritePartialChunk(context.Background(), parent, m.ChunkKey(root, 0), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := w.OpenReader(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err = c.PurgeSelector(root, false); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = r.WaitForHeaders(time.Second); !errors.Is(err, ErrCacheClosed) {
+		t.Fatalf("private header waiter=%v", err)
+	}
+}
+
+func TestPurgedPartialBodyWaiterStopsOnOtherWriterStorageFailure(t *testing.T) {
+	c, m, root, parent, info := partialFixture(t)
+	if _, err := c.PurgeSelector(root, false); err != nil {
+		t.Fatal(err)
+	}
+	w, err := c.OpenWritePartialChunk(context.Background(), parent, m.ChunkKey(root, 0), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.SetHTTPInfo(info)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	r, err := w.OpenReader(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err = w.Write([]byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = io.ReadFull(r, make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan error, 1)
+	go func() { _, err := r.Read(make([]byte, 1)); finished <- err }()
+	s := c.Stripes[0]
+	s.disk = &faultDisk{File: s.Fd, start: s.Start, failAt: 1, writeErr: syscall.EIO}
+	failed, err := c.OpenWrite([]byte("/failure"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = failed.Write([]byte("fail")); err != nil {
+		t.Fatal(err)
+	}
+	if err = failed.Close(); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("fixture failure=%v", err)
+	}
+	if err = <-finished; !errors.Is(err, syscall.EIO) {
+		t.Fatalf("private body waiter=%v", err)
+	}
+}
 
 func TestPurgedParentStreamsLaterChunkWithoutJoiningReplacement(t *testing.T) {
 	c, m, root, parent, info := partialFixture(t)
