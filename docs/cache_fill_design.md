@@ -4,14 +4,14 @@
 
 ## 整对象合并时序
 
-等价并发 MISS 共享一个独立生产者，完成后各自读取；图中省略额度排队与失败分支。
+等价并发 MISS 共享一个独立生产者。头部通过共享准入后，各订阅者绑定确切 writer，独立读取在途字节。
 
-![UML 整对象合并时序](diagrams/coalescing.svg)
+共享 writer 在终态释放活跃 key 所有权；已经订阅的 reader 独立持有原 writer。
 
 | 规则 | 行为 |
 | --- | --- |
 | 聚合窗口 | 无人为延迟；首请求立即启动，后来的加入在途任务 |
-| 等待时间 | 若 0 ms 创建、20 ms 加入、100 ms 提交，两者约等 100/80 ms；不是实测值 |
+| 等待边界 | 头部验证及所需字节到达后即可读取，不以整对象完成作为首字节屏障 |
 | 期限 | 默认 300 秒，从任务创建计时；加入不续期，其他超时可能更早失败 |
 | 取消 | 独立取消；最后订阅者离开才取消生产者；首客户端不拥有共享 Context |
 | 额度 | 默认 16 个任务、每任务 256 个订阅者（含创建者）；过载受控拒绝 |
@@ -26,7 +26,7 @@
 | URL 根键 v3 | 配置命名空间、有效 scheme/Host、原始转义路径、排序后的原始 query 项 |
 | 整对象表示键 | 根键、受支持的 Vary 字段和值 |
 | 在途任务键 | 填充键、方法、Host、peer IP、请求头、TLS 状态、runtime version |
-| 块键 | 根键、完整源站、变体、强 ETag、随机 Incarnation、布局/块大小、块号 |
+| 块键 | 根键、完整源站、变体、强 ETag、随机缓存代次 Generation、布局/块大小、块号 |
 | FillToken | 回源前失效凭证；块从父凭证派生，不重新捕获代次 |
 
 默认模式保留 IP/请求头差异。显式 `shared_fill_public_static=1` 后，任务键与实际回源使用同一规范化：
@@ -45,21 +45,21 @@ Query 契约：源站明确保证顺序无关。只按 `&` 拆分并排序原始
 
 ## 缺块合并与 RWW 时序
 
-假设 fresh manifest 已存在，块 1 MiB；A 读 `[0,2 MiB)`，B 读 `[0.5,1.5 MiB)`，其他身份等价。区间左闭右开；各自发送速度独立。
+假设 fresh 对象元数据 已存在，块 1 MiB；A 读 `[0,2 MiB)`，B 读 `[0.5,1.5 MiB)`，其他身份等价。区间左闭右开；各自发送速度独立。
 
-![UML 缺块合并与 RWW 时序](diagrams/block_rww.svg)
+块内流式和完成位发布顺序见 [RWW 管线](rww_implementation.md)。
 
 | 步骤 | 契约 |
 | --- | --- |
-| manifest | 缺失/过期时共享 HEAD；固定总长、强 ETag、完整源站、变体、Incarnation 和布局 v2 |
+| 对象元数据 | 缺失/过期时共享 HEAD；固定总长、强 ETag、完整源站、变体、Generation 和格式 v3 |
 | 区间映射 | 首尾对齐固定块，尾块按总长截断；只补所需缺块，不后台补全对象 |
 | join | 块任务忽略原始 Range/If-Range，以目标块键区分；先取得写入所有权再发块 GET |
 | 回源 | 固定源站，发送对齐 Range、If-Match、identity；同 ETag 不同源站不混块 |
 | 校验 | 精确 206/Content-Range、强 ETag、长度、编码、实际 EOF、无 Trailer；错误不发布 |
-| 发布/读取 | 每块独立完整提交；各读者校验后读取，只发送所需切片 |
-| 期限/预取 | 每个 manifest/块任务分别计时；每请求最多准备下一块，额度不足退回按需获取 |
+| 发布/读取 | 合法头部后 RWW；完整块数据与目录提交后更新 segment 完成位，客户端只收自身切片 |
+| 期限/资源 | 每个对象元数据/块任务分别计时；读写有独立额度，不后台补完整对象 |
 
-manifest 存在不代表块存在；没有整文件常驻位图。块可独立淘汰；manifest 同 ETag/总长刷新可沿用 Incarnation，丢失重建则换标识。布局变化不混读旧偏移。未知头造成不同任务身份时，写入所有权竞争可失败，不能绕过所有权重复回源。
+对象元数据存在不代表块存在。每64个chunk对应一份按需读取的segment完成位图；实际读取仍检查目录和内容。块可独立淘汰；对象元数据同 ETag/总长刷新可沿用 Generation，丢失重建则换标识。新格式不会把旧记录解释为新的元数据。未知头造成不同任务身份时，写入所有权竞争可失败，不能绕过所有权重复回源。
 
 合格公共大 GET 与 Range 共用块；fresh 整对象 HIT 优先，大 GET 长度须大于 `max(1 MiB, 块大小)`。小对象仍走整对象路径，冷 GET 可能先共享 HEAD。Accept-Encoding 缺省与显式 identity 仍区分。
 
@@ -70,10 +70,10 @@ manifest 存在不代表块存在；没有整文件常驻位图。块可独立�
 | PURGE | 同 URL 普通表示及 Range 家族一起失效；旧 token 不能发布；相邻 URL 已提交数据保留 |
 | PURGE 范围 | 配置 Bearer token 后启用；无 query 且以 `/` 结尾为前缀，否则精确匹配；当前代次会保守影响其他在途操作 |
 | 版本/换源 | 每块发送前检查 token 和可观察版本；不跨源/版本拼接；已发字节不能撤回 |
-| 离线读取 | 同一仍配置源站的 manifest 和所需整区间均 fresh、完整可读时零回源；优先健康候选，再按稳定配置顺序查找 |
+| 离线读取 | 同一仍配置源站的对象元数据 和所需整区间均 fresh、完整可读时零回源；优先健康候选，再按稳定配置顺序查找 |
 | 缺块/损坏/淘汰 | 可受控重取；无可用源站不能保证成功；不提供 stale-if-error |
 | 重启 | 仅恢复完整验证的干净检查点；异常退出可冷 MISS，不承诺每块 fsync |
 
 例：100 MiB 对象依次读 `[0,16 MiB)`、`[8,24 MiB)`，若同版本、fresh、未淘汰，累计正文回源 24 MiB，第二次仅 8 MiB；HEAD 另计。非对齐请求有边界块放大。
 
-配置见 [configuration.md](configuration.md)，Stats 区分请求、块、源站 HEAD/GET/正文口径。多 Range、未提交字节级 HTTP RWW、跨节点合并/失效不支持。代码：[任务](../server/fill_group.go)、[整对象](../server/shared_fill.go)、[块](../server/range_cache.go)；回归：[合并](../server/coalescing_test.go)、[公共身份](../server/public_static_test.go)、[RWW](../server/rww_test.go)、[离线](../server/range_offline_test.go)。
+配置见 [configuration.md](configuration.md)，Stats 区分请求、块、源站 HEAD/GET/正文口径。多 Range 缓存和跨节点合并/失效不支持。代码：[任务](../server/fill_group.go)、[整对象](../server/shared_fill.go)、[块](../server/range_cache.go)；回归：[合并](../server/coalescing_test.go)、[公共身份](../server/public_static_test.go)、[RWW](../server/rww_test.go)、[离线](../server/range_offline_test.go)。
