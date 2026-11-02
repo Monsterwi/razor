@@ -476,10 +476,10 @@ func (s *Server) serveBlocks(w http.ResponseWriter, r *http.Request, root []byte
 		s.upstreamError(w, r, err)
 		return true
 	}
-	return s.servePartialObject(w, r, root, parent, m, info, origin, full, hit, nil)
+	return s.servePartialObject(w, r, root, parent, m, info, origin, full, hit, nil, nil)
 }
 
-func (s *Server) servePartialObject(w http.ResponseWriter, r *http.Request, root []byte, parent *cache.FillToken, m *rangeObject, info *cache.CacheHTTPInfo, origin *proxy.Origin, full, hit bool, task *fillTask) bool {
+func (s *Server) servePartialObject(w http.ResponseWriter, r *http.Request, root []byte, parent *cache.FillToken, m *rangeObject, info *cache.CacheHTTPInfo, origin *proxy.Origin, full, hit bool, task *fillTask, handoff func()) bool {
 	if full && m.Total == 0 {
 		if task != nil {
 			select {
@@ -492,6 +492,11 @@ func (s *Server) servePartialObject(w http.ResponseWriter, r *http.Request, root
 				}
 			}
 		}
+		status := "MISS"
+		if hit {
+			status = "HIT"
+		}
+		s.cacheStatus(w, status)
 		copyHeaders(w.Header(), info.ResponseHeaders)
 		w.Header().Del("Content-Range")
 		w.Header().Set("Content-Length", "0")
@@ -509,9 +514,15 @@ func (s *Server) servePartialObject(w http.ResponseWriter, r *http.Request, root
 		return true
 	}
 	first := start / m.ChunkBytes
-	cursor := &rangeCursor{s: s, request: r, root: root, parent: parent, object: m, origin: origin, last: end / m.ChunkBytes, segment: -1, task: task}
+	if task != nil && !task.partial.full {
+		task = nil
+	}
+	cursor := &rangeCursor{s: s, request: r, root: root, parent: parent, object: m, origin: origin, last: end / m.ChunkBytes, segment: -1, task: task, handoff: handoff}
 	defer cursor.close()
 	sub, err := cursor.open(first)
+	if handoff != nil {
+		handoff()
+	}
 	if errors.Is(err, errRangeBypass) {
 		s.proxyRangeBypass(w, r, origin)
 		return true

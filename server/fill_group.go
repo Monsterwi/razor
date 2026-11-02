@@ -167,7 +167,11 @@ func (task *fillTask) publishStream(writer *cache.CacheVC) {
 
 func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []byte, token *cache.FillToken) {
 	status := "MISS"
-	defer func() { s.cacheStatus(w, status) }()
+	defer func() {
+		if status != "" {
+			s.cacheStatus(w, status)
+		}
+	}()
 	resources := s.captureFillResources(r)
 	if resources.config.SharedFillPublicStatic == 1 {
 		r = resources.proxy.NormalizePublicRequest(r)
@@ -225,12 +229,12 @@ func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []b
 		default:
 		}
 		p := task.partial
-		initial := task
+		var handoff func()
 		if !p.full {
-			initial = nil
-			leave()
+			handoff = leave
 		}
-		s.servePartialObject(w, r, key, task.token, p.object, p.info, p.origin, true, false, initial)
+		status = "" // The partial response records its own final cache outcome.
+		s.servePartialObject(w, r, key, task.token, p.object, p.info, p.origin, true, false, task, handoff)
 		return
 	default:
 	}

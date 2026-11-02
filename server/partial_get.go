@@ -26,7 +26,7 @@ type partialGET struct {
 	origin        *proxy.Origin
 	identity, key string
 	mu            sync.Mutex
-	index         int64
+	index, last   int64
 	chunk         *rangeChunk
 	changed       chan struct{}
 }
@@ -34,8 +34,16 @@ type partialGET struct {
 func (s *Server) serveKnownPartialGET(w http.ResponseWriter, r *http.Request, root []byte) bool {
 	for _, origin := range requestRuntime(r).proxy.ConfiguredOrigins() {
 		key, variant := rangeIdentity(root, origin, r)
-		if _, info, err := s.readRangeObject(r, key, origin.Identity(), variant, cache.PartialChunkBytes); err == nil && requestFresh(r, info, s.now()) {
-			return s.serveBlocks(w, r, root, true)
+		if m, info, err := s.readRangeObject(r, key, origin.Identity(), variant, cache.PartialChunkBytes); err == nil && requestFresh(r, info, s.now()) {
+			if m.Total == 0 || s.fills.hasPartialWork(partialDiscoveryKey(root, r), string(rangeBlockKey(root, m, 0))) {
+				return s.serveBlocks(w, r, root, true)
+			}
+			for segment := int64(0); segment*cache.PartialSegmentChunks*m.ChunkBytes < m.Total; segment++ {
+				coverage, err := s.readRangeCoverage(r, root, m, segment)
+				if err == nil && coverage.Bits != 0 {
+					return s.serveBlocks(w, r, root, true)
+				}
+			}
 		}
 	}
 	return false
@@ -52,26 +60,30 @@ func (s *Server) fillPartialGET(task *fillTask, request *http.Request, root []by
 	if err != nil {
 		return err
 	}
+	identityRequest := request.Clone(request.Context())
+	identityRequest.Header.Del("Range")
+	identityRequest.Header.Del("If-Range")
+	p := &partialGET{full: true, info: info, origin: origin, key: string(rangeBlockKey(root, m, 0)), last: (m.Total - 1) / m.ChunkBytes, changed: make(chan struct{})}
+	p.identity = fillIdentity(identityRequest, []byte(p.key), resources.version)
+	// Reserve the entire stream interval before metadata becomes readable.
+	// Consumers wait for partialReady before accessing the metadata snapshot.
+	s.fills.mu.Lock()
+	task.partial = p
+	s.fills.mu.Unlock()
 	metadata, err := s.reserveRangeObject(task, key, task.token, resources)
 	if err != nil {
 		return err
 	}
 	defer metadata.abort(errors.New("incomplete partial metadata"))
+	metadataWriter := metadata.vc
 	if err := s.writeRangeObject(task, metadata, info, bytes.NewReader(encoded), int64(len(encoded))); err != nil {
 		return err
 	}
-	identityRequest := request.Clone(request.Context())
-	identityRequest.Header.Del("Range")
-	identityRequest.Header.Del("If-Range")
-	m, _, err = s.readRangeObjectData(key, origin.Identity(), variant, cache.PartialChunkBytes)
+	m.Revision, err = metadataWriter.CommittedRevision()
 	if err != nil {
 		return err
 	}
-	p := &partialGET{full: true, object: m, info: info, origin: origin, key: string(rangeBlockKey(root, m, 0)), changed: make(chan struct{})}
-	p.identity = fillIdentity(identityRequest, []byte(p.key), resources.version)
-	s.fills.mu.Lock()
-	task.partial = p
-	s.fills.mu.Unlock()
+	p.object = m
 	close(task.partialReady)
 	for index := int64(0); index*m.ChunkBytes < m.Total; index++ {
 		chunk := &rangeChunk{ready: make(chan struct{}), done: make(chan struct{})}
@@ -100,6 +112,10 @@ func (s *Server) fillPartialGET(task *fillTask, request *http.Request, root []by
 				err = io.ErrUnexpectedEOF
 			}
 			return err
+		}
+		if len(resp.Trailer) != 0 {
+			s.invalidateRange(request, root, task.token, m)
+			return errors.New("origin trailers cannot be shared")
 		}
 	}
 	return nil
@@ -164,6 +180,15 @@ func (s *Server) fillGETChunk(task *fillTask, request *http.Request, root []byte
 
 func (c *rangeCursor) subscribePartial(index int64) (*rangeSubscription, error) {
 	task, p := c.task, c.task.partial
+	select {
+	case <-c.request.Context().Done():
+		return nil, c.request.Context().Err()
+	case <-task.partialReady:
+	case <-task.done:
+		if task.result.err != nil {
+			return nil, task.result.err
+		}
+	}
 	var chunk *rangeChunk
 	for {
 		p.mu.Lock()
@@ -172,7 +197,7 @@ func (c *rangeCursor) subscribePartial(index int64) (*rangeSubscription, error) 
 		if index < current {
 			data, _, release, err := c.s.readRangeBlock(c.request, rangeBlockKey(c.root, c.object, index), c.object, index, false)
 			if err != nil {
-				return nil, err
+				return nil, completedRangeReadError(err)
 			}
 			return &rangeSubscription{body: bytes.NewReader(data), close: release, wait: func() error { return nil }}, nil
 		}
@@ -274,6 +299,10 @@ func (s *Server) serveRangeDiscovery(w http.ResponseWriter, r *http.Request, roo
 				close(task.partialReady)
 			}
 			task.publish(fillResult{err: err})
+			if err == nil {
+				// Keep discovery ownership until subscribers acquire body demand.
+				<-task.ctx.Done()
+			}
 		}()
 	} else {
 		resources.release()
@@ -291,12 +320,11 @@ func (s *Server) serveRangeDiscovery(w http.ResponseWriter, r *http.Request, roo
 	select {
 	case <-task.partialReady:
 		p := task.partial
-		initial := task
+		var handoff func()
 		if !p.full {
-			initial = nil
-			leave()
+			handoff = leave
 		}
-		s.servePartialObject(w, r, root, parent, p.object, p.info, p.origin, false, false, initial)
+		s.servePartialObject(w, r, root, parent, p.object, p.info, p.origin, false, false, task, handoff)
 	default:
 		if errors.Is(task.result.err, errRangeBypass) || errors.Is(task.result.err, errUnshareable) || task.result.err == nil {
 			s.proxyWithoutCache(w, r)
@@ -314,7 +342,7 @@ func (g *fillGroup) joinPartial(id, root string, token *cache.FillToken, cfg *co
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for _, task := range g.tasks {
-		if task.partialRoot == root && task.id != id && task.ctx.Err() == nil && g.cache.CheckFill(task.token) == nil {
+		if cfg.SharedFillPublicStatic == 1 && task.partialRoot == root && task.id != id && task.ctx.Err() == nil && g.cache.CheckFill(task.token) == nil {
 			return nil, false, errRangeOwnership
 		}
 	}
@@ -323,4 +351,18 @@ func (g *fillGroup) joinPartial(id, root string, token *cache.FillToken, cfg *co
 		task.partialRoot = root
 	}
 	return task, creator, err
+}
+
+// Discovery stays registered through the first interval claim. The table is
+// bounded by SharedFillMaxTasks, independent of object length.
+func (g *fillGroup) hasPartialWork(root, object string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, task := range g.tasks {
+		if task.ctx.Err() == nil && g.cache.CheckFill(task.token) == nil &&
+			(task.partialRoot == root || task.rangeRun != nil && task.rangeRun.object == object) {
+			return true
+		}
+	}
+	return false
 }

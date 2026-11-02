@@ -41,7 +41,7 @@ func (g *fillGroup) claimRange(identity, object string, first, last int64, token
 			p.mu.Lock()
 			current := p.index
 			p.mu.Unlock()
-			if first >= current && first <= (p.object.Total-1)/p.object.ChunkBytes {
+			if first >= current && first <= p.last {
 				if p.identity != identity {
 					return nil, false, errRangeOwnership
 				}
@@ -99,6 +99,7 @@ type rangeCursor struct {
 	coverage cache.PartialCoverage
 	task     *fillTask
 	leave    func()
+	handoff  func()
 }
 
 func (c *rangeCursor) close() {
@@ -242,6 +243,10 @@ func (c *rangeCursor) openChunk(index int64) (*rangeSubscription, error) {
 		return nil, err
 	}
 	c.task, c.leave = task, func() { c.s.fills.leave(task, creator) }
+	if c.handoff != nil {
+		c.handoff()
+		c.handoff = nil
+	}
 	if creator {
 		originRequest := withRequestRuntime(request, task.ctx, resources.runtime)
 		go func() {

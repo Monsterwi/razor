@@ -59,7 +59,8 @@ def record(output, evidence, name, **details):
 def barrier_response(product, origin, client, path, full=False):
     block = product.args.block_bytes
     entered, gate = threading.Event(), threading.Event()
-    origin.rules[path] = {"body_gate_at": block, "entered": entered, "gate": gate}
+    first_bytes = 6 << 10 if full else block
+    origin.rules[path] = {"body_gate_at": first_bytes, "entered": entered, "gate": gate}
     bounds = None if full else (0, 3 * block - 1)
     expected = client.expected(path, bounds=bounds)
     c = http.client.HTTPConnection("127.0.0.1", product.port, timeout=8)
@@ -70,12 +71,14 @@ def barrier_response(product, origin, client, path, full=False):
         c.request("GET", path, headers=headers)
         response = c.getresponse()
         assert response.status == (200 if full else 206)
-        prefix = response.read(block)
-        assert len(prefix) == block and entered.wait(5), "first committed chunk or body gate missing"
+        prefix = response.read(first_bytes - 1 if full else first_bytes)
+        assert len(prefix) == (first_bytes - 1 if full else first_bytes) and entered.wait(5), "RWW prefix or body gate missing"
         assert not gate.is_set(), "barrier unexpectedly released"
-        assert origin.snapshot(path)["bytes"] == block, origin.snapshot(path)
+        assert origin.snapshot(path)["bytes"] == first_bytes, origin.snapshot(path)
+        if full:
+            assert origin.snapshot(path)["get"] == 1 and origin.snapshot(path)["head"] == 0, origin.snapshot(path)
         digest, length = hashlib.sha256(prefix), len(prefix)
-        assert digest.hexdigest() == client.expected(path, bounds=(0, block - 1))[1]
+        assert digest.hexdigest() == client.expected(path, bounds=(0, len(prefix) - 1))[1]
         gate.set()
         while True:
             body = response.read(CHUNK)
@@ -84,7 +87,7 @@ def barrier_response(product, origin, client, path, full=False):
             digest.update(body)
             length += len(body)
         assert (length, digest.hexdigest()) == expected, (length, expected)
-        return {"status": response.status, "bytes": length, "sha256": digest.hexdigest(), "first_block_before_release": True}
+        return {"status": response.status, "bytes": length, "sha256": digest.hexdigest(), "prefix_before_release": len(prefix), "origin": origin.snapshot(path)}
     finally:
         gate.set()
         c.close()
@@ -105,7 +108,11 @@ def public_functional(args, fixtures, output, smoke=False):
         for _ in range(2):
             client.checked(product, "/small-public")
         assert origin.snapshot("/small-public")["bytes"] == 256 << 10
-        record(output, evidence, "256KiB whole-object public MISS/HIT")
+        before = origin.snapshot("/small-public")
+        client.checked(product, "/small-public", headers={"Range": "bytes=17-65535"}, status=206,
+                       expected=client.expected("/small-public", bounds=(17, 65535)))
+        assert before == origin.snapshot("/small-public") and before["get"] == 1 and before["head"] == 0
+        record(output, evidence, "256KiB GET and Range share partial chunks", origin=before)
         left, right = ((2, 1) if smoke else (16, 8))
         path = "/large-union"
         for start, end, expected_origin in ((0, left * MIB, left * MIB), (right * MIB, (left + right) * MIB, (left + right) * MIB)):
@@ -125,7 +132,7 @@ def public_functional(args, fixtures, output, smoke=False):
         record(output, evidence, "full GET and Range reuse identical blocks", origin=before)
         for full in (False, True):
             details = barrier_response(product, origin, client, "/large-barrier-" + str(full), full)
-            record(output, evidence, "real HTTP committed first block before blocked second: " + ("GET" if full else "Range"), **details)
+            record(output, evidence, "real HTTP RWW prefix before blocked origin: " + ("GET" if full else "Range"), **details)
         for fault in ("truncate", "force_status"):
             path = "/large-body-error-" + fault
             origin.rules[path] = ({"truncate_at": block + CHUNK} if fault == "truncate"

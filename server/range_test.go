@@ -288,6 +288,7 @@ func TestRangePurgeFencesAllBlocksAndKeepsAdjacentURL(t *testing.T) {
 	endpoint := httptest.NewServer(s)
 	defer func() { once.Do(func() { close(release) }); endpoint.Close() }()
 	first := make(chan error, 1)
+	started := make(chan struct{})
 	go func() {
 		req, _ := http.NewRequest("GET", endpoint.URL+"/item?b=2&a=1", nil)
 		req.Host = "cache.test"
@@ -298,15 +299,29 @@ func TestRangePurgeFencesAllBlocksAndKeepsAdjacentURL(t *testing.T) {
 			return
 		}
 		defer resp.Body.Close()
+		prefix := make([]byte, 1<<20)
+		if _, err := io.ReadFull(resp.Body, prefix); err != nil || resp.StatusCode != 206 || !bytes.Equal(prefix, data[:len(prefix)]) {
+			first <- fmt.Errorf("pre-PURGE prefix: status=%d err=%v", resp.StatusCode, err)
+			return
+		}
+		close(started)
 		body, err := io.ReadAll(resp.Body)
-		if err == nil || len(body) == len(data) {
-			err = fmt.Errorf("pre-PURGE completed: status=%d bytes=%d", resp.StatusCode, len(body))
+		if err == nil || len(prefix)+len(body) == len(data) {
+			err = fmt.Errorf("pre-PURGE completed: status=%d bytes=%d", resp.StatusCode, len(prefix)+len(body))
 		} else {
 			err = nil
 		}
 		first <- err
 	}()
 	<-entered
+	// The origin gate alone does not prove the downstream response started.
+	select {
+	case <-started:
+	case err := <-first:
+		t.Fatal(err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("pre-PURGE response prefix did not arrive")
+	}
 	if got = purge(s, "http://cache.test/item?b=2&a=1", "test-secret"); got.Code != 200 {
 		t.Fatal(got.Code)
 	}

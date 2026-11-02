@@ -20,7 +20,7 @@ make build
 
 目录包含 [records.config](conf/records.config) 和 [storage.config](conf/storage.config)；先设置端口、源站、日志和缓存文件路径。缓存身份保留原始 Query 顺序，包括重复参数；换序请求分别缓存。
 
-公共静态大 GET 与单 Range 共用块时，配置示例：
+符合准入条件的普通 GET 与单 Range 共用分块缓存。若静态资源可跨客户端身份共享回源，可启用公共模式：
 
 ```text
 CONFIG proxy.config.cache.shared_fill_public_static INT 1

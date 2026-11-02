@@ -132,6 +132,23 @@ func (vc *CacheVC) OpenReader(ctx context.Context) (*CacheVC, error) {
 		reader: reader, entry: vc.entry, generation: vc.generation, done: readCtx.Done(), readCancel: cancel}, nil
 }
 
+// CommittedRevision identifies this writer's committed record, even after its
+// key is replaced. It never adopts the current directory entry's revision.
+func (vc *CacheVC) CommittedRevision() (uint64, error) {
+	if !vc.writing || vc.writer == nil {
+		return 0, fmt.Errorf("no writer revision")
+	}
+	vc.writer.mutex.RLock()
+	defer vc.writer.mutex.RUnlock()
+	if vc.writer.err != nil {
+		return 0, vc.writer.err
+	}
+	if !vc.writer.closed {
+		return 0, fmt.Errorf("writer has not committed")
+	}
+	return vc.writer.version, nil
+}
+
 func (vc *CacheVC) WaitForHeaders(timeout time.Duration) error {
 	if !vc.IsRWW() {
 		return nil
