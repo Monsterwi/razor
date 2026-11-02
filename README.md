@@ -40,6 +40,8 @@ make test-race
 go vet ./...
 ```
 
+[Plan A 验收与成本](docs/benchmarks/partial_object_cache_2026-11-02.md)：GET/Range 双向复用、块内 RWW、版本/PURGE/恢复，以及源站流量和元数据成本的固定样例。
+
 [2026-10-24 历史压测](docs/benchmarks/ats_comparison_2026-10-24.md)：源码 `8581267`，256 KiB 热命中，C32/C100；三轮原值和配置随报告附带。该次测量未覆盖大文件、HDD 或长测，同机结果不代表公网生产容量。
 
 块路径要求强 ETag、总长和 identity。头部校验后可读取在途字节；完整校验提交后才更新覆盖位图。不支持多 Range 块缓存、跨节点一致性或 io_uring；提交不等于逐块 fsync。

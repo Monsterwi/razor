@@ -32,6 +32,10 @@
 
 完整边界：[填充/失效](cache_fill_design.md)、[RWW](rww_implementation.md)、[RAM](ram_cache.md)、[存储](cache_storage_format.md)。
 
+## Plan A 验收
+
+[2026-11-02 验收与成本报告](benchmarks/partial_object_cache_2026-11-02.md)关联父规格逐项测试、真实进程结果、固定版本与测量原值。单字节响应等待对应块完整校验；PURGE 后慢读旧流可能按原版本有界补取历史块，报告分别计量。
+
 ## 历史压测
 
 以下保留 [2026-10-24 结果](benchmarks/ats_comparison_2026-10-24.md)，测量源码 `8581267`。
