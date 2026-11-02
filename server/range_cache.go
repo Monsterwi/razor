@@ -572,6 +572,7 @@ func (s *Server) servePartialObject(w http.ResponseWriter, r *http.Request, root
 	if err = http.NewResponseController(w).Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
 		panic(http.ErrAbortHandler)
 	}
+	cursor.started = true
 	for index := first; index <= end/m.ChunkBytes; index++ {
 		if index != first {
 			sub, err = cursor.open(index)
@@ -580,7 +581,7 @@ func (s *Server) servePartialObject(w http.ResponseWriter, r *http.Request, root
 			}
 		}
 		hit = hit && sub.reused
-		if s.checkRangeVersion(root, parent, m) != nil {
+		if cursor.check() != nil {
 			panic(http.ErrAbortHandler)
 		}
 		low := max(start-index*m.ChunkBytes, int64(0))

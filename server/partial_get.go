@@ -129,7 +129,7 @@ func (s *Server) fillGETChunk(task *fillTask, request *http.Request, root []byte
 	chunkInfo.ResponseHeaders = info.ResponseHeaders.Clone()
 	chunkInfo.ResponseHeaders.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+size-1, m.Total))
 	chunkInfo.ResponseHeaders.Set("Content-Length", strconv.FormatInt(size, 10))
-	fill, err := s.reserveRangeObject(task, rangeBlockKey(root, m, index), task.token, resources)
+	fill, err := s.reservePartialChunk(task, rangeBlockKey(root, m, index), task.token, size, resources)
 	if err != nil {
 		return err
 	}
@@ -172,10 +172,7 @@ func (s *Server) fillGETChunk(task *fillTask, request *http.Request, root []byte
 			return errors.New("origin trailers cannot be shared")
 		}
 	}
-	if err := fill.commit(); err != nil {
-		return err
-	}
-	return s.cache.PublishPartialChunk(task.ctx, task.token, root, m, index, &chunkInfo)
+	return s.commitPartialChunk(fill, task, task.token, root, m, index, &chunkInfo)
 }
 
 func (c *rangeCursor) subscribePartial(index int64) (*rangeSubscription, error) {

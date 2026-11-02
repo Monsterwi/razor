@@ -21,6 +21,9 @@ func (s *Server) produceFill(task *fillTask, r *http.Request, key []byte, resour
 	}
 	if result.err == nil {
 		result.err = s.cache.CheckFill(task.token)
+		if task.partial != nil && task.partial.full && errors.Is(result.err, cache.ErrPurged) {
+			result.err = nil // The original stream completed without cache publication.
+		}
 	}
 	task.publish(result)
 }

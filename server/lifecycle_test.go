@@ -339,11 +339,20 @@ func TestCacheCommitFailureDoesNotPublishOrigin(t *testing.T) {
 	if err = c.Stripes[0].Fd.Close(); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
-		assertFailedSharedHTTP(t, front.Client(), front.URL+"/object")
+	assertFailedSharedHTTP(t, front.Client(), front.URL+"/object")
+	// Storage failure outranks PURGE revocation: a known permanent error
+	// rejects subsequent fills before origin I/O, rather than enabling private streaming.
+	resp, err := front.Client().Get(front.URL + "/object")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusServiceUnavailable || string(body) == "complete origin body" {
+		t.Fatalf("known storage failure was not rejected: status=%d body=%q err=%v", resp.StatusCode, body, err)
 	}
 	st := s.Stats()
-	if calls.Load() != 2 || st.CacheWriteErrors == 0 || st.CacheWriters != 0 || st.BufferReserved != 0 {
+	if calls.Load() != 1 || st.Hits != 0 || st.CacheWriteErrors == 0 || st.CacheWriters != 0 || st.BufferReserved != 0 {
 		t.Fatalf("failed cache commit was reused or leaked: calls=%d stats=%+v", calls.Load(), st)
 	}
 	if err = s.Shutdown(); err == nil {

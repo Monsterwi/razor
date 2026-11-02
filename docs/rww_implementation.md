@@ -49,9 +49,9 @@ sequenceDiagram
 | 客户端条件请求 / 非法区间 | 透传 / 416 |
 | 下游缓存 | 合成 200/206 使用 Cache-Control: no-cache；内部逐块判断 freshness |
 
-每块发送前检查失效；已发/网络缓冲字节不可撤回。对象元数据被淘汰只表示版本未知；发现新版元数据也不会中断仍可获得的旧版本字节。后续补块始终约束已选强 ETag，无法取得则失败，本次请求不换版重试。提交不等于逐块 fsync，恢复边界见 [存储文档](cache_storage_format.md)。HTTP RWW 通过 CacheVC.OpenReader 绑定确切 writer，旧订阅的关闭不会移除同 key 新任务。
+每块发送前检查失效；仅已开始响应的 PURGE 发布权撤销允许继续，存储失败、关闭及其他强制失效仍失败。已发/网络缓冲字节不可撤回。对象元数据被淘汰只表示版本未知；发现新版元数据也不会中断仍可获得的旧版本字节。后续补块始终约束已选强 ETag，无法取得则失败，本次请求不换版重试。提交不等于逐块 fsync，恢复边界见 [存储文档](cache_storage_format.md)。HTTP RWW 通过 CacheVC.OpenReader 绑定确切 writer，旧订阅的关闭不会移除同 key 新任务。
 
-每个请求范围在本块的最后一个字节等待完整验证与完成位发布，避免客户端读满 Content-Length 后正常断开取消对齐填充。普通范围仍提前输出前缀；只有一个字节的范围没有可提前发送的前缀，需等本块验证完成。
+每个请求范围在本块的最后一个字节等待完整验证；可发布时还等待完成位发布，PURGE 后私有续流不发布完成位，避免客户端读满 Content-Length 后正常断开取消对齐填充。普通范围仍提前输出前缀；只有一个字节的范围没有可提前发送的前缀，需等本块验证完成。
 
 连续缺块最多以两个 chunk 合并为一次 Range 回源；每个 chunk 有独立就绪和完成通知，因此首块不会等待下一块。客户端始终按对象绝对偏移裁剪，segment 边界分开规划。头部通过准入后显式发送响应头，再读取可能失败的在途正文，避免复用连接上的客户端把未发送头的中断误判为可自动重试的请求。
 
@@ -64,3 +64,5 @@ Plan A 固定每个 chunk 为 1 MiB、每个 segment 包含 64 个 chunk。兼�
 ```bash
 go test ./server -run 'Test(RangeCommittedBlockArrivesBeforeSecondBlock|PublicGETCommittedBlockArrivesBeforeSecondBlock|PublicGETAndOverlappingRangeShareBlockProducers|RangeOnlyFetchesMissingAlignedUnion|CommittedBlockStreamAbortsOnLaterOriginFailure)$' -count=1 -timeout 120s
 ```
+
+PURGE 后的私有块继续使用 `CacheVC.OpenReader`，每个 writer 最多1MiB；普通 GET 仅持当前 slot，Range run 最多两个 slot。完成 writer 的当前块字节保留到确切 reader/slot 释放，旧 reader 不会读到同 key replacement。后续未启动的 run 可以按原 ETag 私有回源；若旧版本不可取得，响应异常结束且不重试为新版。

@@ -33,10 +33,20 @@ type rangeRun struct {
 
 // claimRange atomically joins an interval or reserves a non-overlapping run.
 // A hit already shortened last before this call; an existing owner also cuts it.
-func (g *fillGroup) claimRange(identity, object string, first, last int64, token *cache.FillToken, cfg *config.Config) (*fillTask, bool, error) {
+func (g *fillGroup) claimRange(identity, object string, first, last int64, token *cache.FillToken, cfg *config.Config, started bool) (*fillTask, bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	private := false
+	if err := g.cache.CheckFill(token); err != nil {
+		if !started || !errors.Is(err, cache.ErrPurged) {
+			return nil, false, err
+		}
+		private = true
+	}
 	for _, task := range g.tasks {
+		if private {
+			break // A continued old response never joins a new request's work.
+		}
 		if p := task.partial; p != nil && p.full && p.key == object && task.ctx.Err() == nil && g.cache.CheckFill(task.token) == nil {
 			p.mu.Lock()
 			current := p.index
@@ -75,7 +85,18 @@ func (g *fillGroup) claimRange(identity, object string, first, last int64, token
 	// An older run may still own its next chunk after this prefix completed.
 	// Keep it registered, but never attach a replacement to its completed slot.
 	g.rangeSequence++
-	task, creator, err := g.joinLocked(fmt.Sprintf("range:%s:%d:%d", identity, first, g.rangeSequence), token, cfg)
+	id := fmt.Sprintf("range:%s:%d:%d", identity, first, g.rangeSequence)
+	var task *fillTask
+	var creator bool
+	var err error
+	if private {
+		task, creator, err = g.newTaskLocked(id, token, cfg)
+	} else {
+		task, creator, err = g.joinLocked(id, token, cfg)
+		if started && errors.Is(err, cache.ErrPurged) {
+			task, creator, err = g.newTaskLocked(id, token, cfg)
+		}
+	}
 	if err != nil || !creator {
 		return task, creator, err
 	}
@@ -100,6 +121,7 @@ type rangeCursor struct {
 	task     *fillTask
 	leave    func()
 	handoff  func()
+	started  bool
 }
 
 func (c *rangeCursor) close() {
@@ -143,10 +165,10 @@ func (r *rangeChunkReader) recover(err error) error {
 		r.sub = nil
 	}
 	c := r.cursor
-	if err := c.s.checkRangeVersion(c.root, c.parent, c.object); err != nil {
+	if err := c.check(); err != nil {
 		return err
 	}
-	r.recovery = &rangeCursor{s: c.s, request: c.request, root: c.root, parent: c.parent, object: c.object, origin: c.origin, last: r.index, segment: -1}
+	r.recovery = &rangeCursor{s: c.s, request: c.request, root: c.root, parent: c.parent, object: c.object, origin: c.origin, last: r.index, segment: -1, started: c.started}
 	r.sub, err = r.recovery.openChunk(r.index)
 	if err != nil {
 		return err
@@ -208,12 +230,12 @@ func (c *rangeCursor) openChunk(index int64) (*rangeSubscription, error) {
 			return &rangeSubscription{body: bytes.NewReader(data), close: release, wait: func() error { return nil }, reused: true}, nil
 		}
 		release()
-		if err := c.repairCoverage(index, info); err != nil {
+		if err := c.repairCoverage(index, info); err != nil && !(c.started && errors.Is(err, cache.ErrPurged)) {
 			return nil, err
 		}
 		c.coverage.Bits &^= mask
 	}
-	if err := c.s.checkRangeVersion(c.root, c.parent, c.object); err != nil {
+	if err := c.check(); err != nil {
 		return nil, err
 	}
 	last := min(c.last, index+maxRangeRunChunks-1, (segment+1)*cache.PartialSegmentChunks-1)
@@ -225,7 +247,10 @@ func (c *rangeCursor) openChunk(index int64) (*rangeSubscription, error) {
 	}
 	token, err := c.s.cache.DeriveFill(c.parent, rangeBlockKey(c.root, c.object, index))
 	if err != nil {
-		return nil, err
+		if !c.started || !errors.Is(err, cache.ErrPurged) {
+			return nil, err
+		}
+		token = c.parent
 	}
 	resources := c.s.captureFillResources(c.request)
 	request := c.request
@@ -237,7 +262,7 @@ func (c *rangeCursor) openChunk(index int64) (*rangeSubscription, error) {
 	identityRequest.Header.Del("If-Range")
 	objectKey := rangeBlockKey(c.root, c.object, 0)
 	identity := fillIdentity(identityRequest, objectKey, resources.version)
-	task, creator, err := c.s.fills.claimRange(identity, string(objectKey), index, last, token, resources.config)
+	task, creator, err := c.s.fills.claimRange(identity, string(objectKey), index, last, token, resources.config, c.started)
 	if err != nil {
 		resources.release()
 		return nil, err
@@ -308,12 +333,16 @@ func (c *rangeCursor) subscribe(index int64) (*rangeSubscription, error) {
 		completed = true
 	default:
 	}
-	if completed {
+	if completed && !(c.started && chunk.writer != nil && errors.Is(c.s.cache.CheckFill(c.parent), cache.ErrPurged)) {
 		data, _, release, err := c.s.readRangeBlock(c.request, rangeBlockKey(c.root, c.object, index), c.object, index, false)
-		if err != nil {
+		if err == nil {
+			return &rangeSubscription{body: bytes.NewReader(data), close: release, wait: wait}, nil
+		}
+		if !c.started || chunk.writer == nil || !errors.Is(c.s.cache.CheckFill(c.parent), cache.ErrPurged) {
 			return nil, completedRangeReadError(err)
 		}
-		return &rangeSubscription{body: bytes.NewReader(data), close: release, wait: wait}, nil
+		// PURGE may race the committed lookup; the exact bounded writer still
+		// holds this response's validated bytes, independent of its old key.
 	}
 	rt := requestRuntime(c.request)
 	release, err := rt.rangeReaders.Acquire(c.request.Context(), time.Duration(rt.config.QueueTimeout)*time.Second)
@@ -399,7 +428,7 @@ func (s *Server) fetchRangeRun(task *fillTask, request *http.Request, root []byt
 		chunkInfo.ResponseHeaders = resp.Header().Clone()
 		chunkInfo.ResponseHeaders.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", chunkStart, chunkStart+size-1, m.Total))
 		chunkInfo.ResponseHeaders.Set("Content-Length", strconv.FormatInt(size, 10))
-		fill, err := s.reserveRangeObject(task, rangeBlockKey(root, m, index), parent, resources)
+		fill, err := s.reservePartialChunk(task, rangeBlockKey(root, m, index), parent, size, resources)
 		if err != nil {
 			return err
 		}
@@ -449,10 +478,7 @@ func (s *Server) fetchRangeRun(task *fillTask, request *http.Request, root []byt
 		if err := task.ctx.Err(); err != nil {
 			return err
 		}
-		if err := fill.commit(); err != nil {
-			return err
-		}
-		if err := s.cache.PublishPartialChunk(task.ctx, parent, root, m, index, &chunkInfo); err != nil {
+		if err := s.commitPartialChunk(fill, task, parent, root, m, index, &chunkInfo); err != nil {
 			return err
 		}
 		close(chunk.done)

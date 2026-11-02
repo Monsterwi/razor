@@ -101,11 +101,19 @@ func (g *fillGroup) joinLocked(id string, token *cache.FillToken, cfg *config.Co
 		}
 		delete(g.tasks, id)
 	}
-	if g.active >= cfg.SharedFillMaxTasks {
-		return nil, false, budget.ErrOverloaded
-	}
 	if err := g.cache.CheckFill(token); err != nil {
 		return nil, false, err
+	}
+	return g.newTaskLocked(id, token, cfg)
+}
+
+// Both public and private partial runs use the same bounded task lifetime.
+func (g *fillGroup) newTaskLocked(id string, token *cache.FillToken, cfg *config.Config) (*fillTask, bool, error) {
+	if err := g.ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if g.active >= cfg.SharedFillMaxTasks {
+		return nil, false, budget.ErrOverloaded
 	}
 	ctx, cancel := context.WithTimeout(g.ctx, time.Duration(cfg.SharedFillTimeout)*time.Second)
 	task := &fillTask{id: id, token: token, ctx: ctx, cancel: cancel, refs: 1, done: make(chan struct{}), creatorGone: make(chan struct{}), privateDone: make(chan struct{}), exited: make(chan struct{}), private: make(chan *http.Response), streamReady: make(chan struct{}), partialReady: make(chan struct{})}

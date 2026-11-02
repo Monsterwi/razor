@@ -306,10 +306,8 @@ func TestRangePurgeFencesAllBlocksAndKeepsAdjacentURL(t *testing.T) {
 		}
 		close(started)
 		body, err := io.ReadAll(resp.Body)
-		if err == nil || len(prefix)+len(body) == len(data) {
-			err = fmt.Errorf("pre-PURGE completed: status=%d bytes=%d", resp.StatusCode, len(prefix)+len(body))
-		} else {
-			err = nil
+		if err != nil || !bytes.Equal(body, data[len(prefix):]) {
+			err = fmt.Errorf("started pre-PURGE response did not complete: status=%d bytes=%d err=%v", resp.StatusCode, len(prefix)+len(body), err)
 		}
 		first <- err
 	}()

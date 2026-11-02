@@ -22,13 +22,13 @@
 
 | 类别 | 限制 |
 | --- | --- |
-| PURGE | 默认关闭；Bearer token 启用；精确/路径前缀失效普通表示与 Range 家族；旧 token 不复活，当前代次可保守影响其他在途任务 |
+| PURGE | 默认关闭；Bearer token 启用；精确/路径前缀失效普通表示与 Range 家族；旧 token 不复活；已开始响应可按原版本有界私有续流；非目标对象保留，事件历史窗口见失效文档 |
 | Range | Range 通过 HEAD、冷 GET 通过单次普通响应发现总长/强 ETag/identity；多 Range、弱 ETag 等旁路；合成下游响应 no-cache；后块失败中断流 |
 | 容量 | max_object_bytes 默认 64 MiB；大对象测试须调大；块按必要窗口，不要求磁盘容纳整文件 |
 | 索引 | 每 stripe 至多 min(目录容量, 65,536) 映射、16 MiB 键/selector 字符串、每键/selector 16 KiB；URL 对象元数据快照上限 64 |
 | 任务/资源 | 默认 16 生产任务、每任务 256 订阅者、300 秒；请求/源站/写者/读者/队列另限额，非总 RSS 预算 |
 | 持久性 | 提交不等于逐块 fsync；异常退出可冷 MISS，不截断旧文件；同缓存 inode 不跨进程共享 |
-| 未支持 | 未提交字节级 HTTP RWW、多 Range 块缓存、跨节点合并/一致性/PURGE、HTTP/3、io_uring/native AIO |
+| 未支持 | 多 Range 块缓存、跨节点合并/一致性/PURGE、HTTP/3、io_uring/native AIO |
 
 完整边界：[填充/失效](cache_fill_design.md)、[RWW](rww_implementation.md)、[RAM](ram_cache.md)、[存储](cache_storage_format.md)。
 
