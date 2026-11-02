@@ -41,6 +41,7 @@ type fillTask struct {
 	private                                chan *http.Response
 	streamReady                            chan struct{}
 	stream                                 *cache.CacheVC
+	rangeRun                               *rangeRun
 	result                                 fillResult
 }
 
@@ -83,6 +84,10 @@ func fillIdentity(r *http.Request, key []byte, version uint64) string {
 func (g *fillGroup) join(id string, token *cache.FillToken, cfg *config.Config) (*fillTask, bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	return g.joinLocked(id, token, cfg)
+}
+
+func (g *fillGroup) joinLocked(id string, token *cache.FillToken, cfg *config.Config) (*fillTask, bool, error) {
 	if err := g.ctx.Err(); err != nil {
 		return nil, false, err
 	}

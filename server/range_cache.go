@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/Monsterwi/razor/cache"
-	"github.com/Monsterwi/razor/internal/budget"
 	"github.com/Monsterwi/razor/proxy"
 )
 
@@ -382,130 +381,6 @@ func (s *Server) readRangeCoverage(r *http.Request, root []byte, m *rangeObject,
 	return s.cache.PartialCoverage(root, m, segment)
 }
 
-func (s *Server) openRangeBlock(r *http.Request, root []byte, parent *cache.FillToken, m *rangeObject, index int64, origin *proxy.Origin, prefetch bool) (*rangeSubscription, error) {
-	key := rangeBlockKey(root, m, index)
-	coverage, _ := s.readRangeCoverage(r, root, m, index/cache.PartialSegmentChunks)
-	var data []byte
-	var cachedInfo *cache.CacheHTTPInfo
-	release := func() {}
-	readErr := cache.ErrNotResident
-	if coverage.Bits&(uint64(1)<<uint(index%cache.PartialSegmentChunks)) != 0 {
-		data, cachedInfo, release, readErr = s.readRangeBlock(r, key, m, index, prefetch)
-	}
-	if readErr == nil && s.rangeBlockFresh(r, cachedInfo) {
-		return &rangeSubscription{body: bytes.NewReader(data), close: release, wait: func() error { return nil }, reused: true}, nil
-	}
-	release()
-	if prefetch && errors.Is(readErr, budget.ErrOverloaded) {
-		return nil, readErr
-	}
-	if err := s.checkRangeVersion(root, parent, m); err != nil {
-		return nil, err
-	}
-	token, err := s.cache.DeriveFill(parent, key)
-	if err != nil {
-		return nil, err
-	}
-	task, leave, err := s.startRangeFill(r, key, token, prefetch, func(task *fillTask, request *http.Request, resources fillResources) fillResult {
-		coverage, _ := s.cache.PartialCoverage(root, m, index/cache.PartialSegmentChunks)
-		if coverage.Bits&(uint64(1)<<uint(index%cache.PartialSegmentChunks)) != 0 {
-			if _, info, err := s.readRangeBlockData(key, m, index); err == nil && s.rangeBlockFresh(request, info) {
-				return fillResult{key: key}
-			}
-		}
-		if !origin.Available() {
-			return fillResult{err: errRangeUnavailable}
-		}
-		fill, err := s.reserveRangeObject(task, key, parent, resources)
-		if err != nil {
-			return fillResult{err: err}
-		}
-		defer fill.abort(errors.New("incomplete range object"))
-		start := index * m.ChunkBytes
-		end := min(start+m.ChunkBytes, m.Total) - 1
-		request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-		request.Header.Del("If-Range")
-		request.Header.Set("If-Match", m.ETag)
-		request.Header.Set("Accept-Encoding", "identity")
-		started := s.now()
-		resp, headers, err := origin.ProxyWithOriginHeaders(request)
-		if err != nil {
-			return fillResult{err: err}
-		}
-		defer resp.RawBody().Close()
-		if resp.StatusCode() != 206 || headers.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", start, end, m.Total) || len(headers.Values("Content-Range")) != 1 || headers.Get("ETag") != m.ETag || len(headers.Values("ETag")) != 1 || resp.RawResponse.ContentLength != end-start+1 || !identityEncoding(headers) || len(resp.RawResponse.Trailer) != 0 {
-			s.invalidateRange(request, root, parent, m)
-			if resp.StatusCode() == 200 && headers.Get("ETag") == m.ETag && resp.RawResponse.ContentLength == m.Total {
-				return fillResult{err: errRangeBypass}
-			}
-			return fillResult{err: errRangeChanged}
-		}
-		info := cache.NewCacheHTTPInfo()
-		info.RequestTime, info.ResponseTime = started, s.now()
-		info.RequestMethod, info.RequestURL, info.Status = http.MethodGet, r.URL.String(), 200
-		info.ResponseHeaders = headers.Clone()
-		info.ResponseHeaders.Del("Content-Range")
-		if _, safe := responsePolicy(info, s.now()); !safe {
-			s.invalidateRange(request, root, parent, m)
-			return fillResult{err: errRangeBypass}
-		}
-		info.Status = 206
-		info.ResponseHeaders = resp.Header().Clone()
-		fill.vc.SetHTTPInfo(info)
-		task.publishStream(fill.vc)
-		err = s.writeRangeObject(task, fill, info, resp.RawBody(), end-start+1)
-		if err == nil {
-			err = s.cache.PublishPartialChunk(task.ctx, parent, root, m, index, info)
-		}
-		return fillResult{key: key, err: err}
-	})
-	if err != nil {
-		return nil, err
-	}
-	wait := func() error {
-		select {
-		case <-r.Context().Done():
-			return r.Context().Err()
-		case <-task.done:
-			return task.result.err
-		}
-	}
-	streaming := false
-	select {
-	case <-r.Context().Done():
-		leave()
-		return nil, r.Context().Err()
-	case <-task.streamReady:
-		streaming = true
-	case <-task.done:
-	}
-	if !streaming {
-		if task.result.err != nil {
-			leave()
-			return nil, task.result.err
-		}
-		data, _, release, err := s.readRangeBlock(r, key, m, index, prefetch)
-		if err != nil {
-			leave()
-			return nil, err
-		}
-		return &rangeSubscription{body: bytes.NewReader(data), close: func() { release(); leave() }, wait: wait}, nil
-	}
-	rt := requestRuntime(r)
-	releaseReader, err := rt.rangeReaders.Acquire(r.Context(), time.Duration(rt.config.QueueTimeout)*time.Second)
-	if err != nil {
-		leave()
-		return nil, err
-	}
-	reader, err := task.stream.OpenReader(r.Context())
-	if err != nil {
-		releaseReader()
-		leave()
-		return nil, err
-	}
-	return &rangeSubscription{body: reader, close: func() { reader.Close(); releaseReader(); leave() }, wait: wait}, nil
-}
-
 func (s *Server) rangeFits(root []byte, m *rangeObject, start, end int64) bool {
 	required := make(map[*cache.Stripe]int64, 2)
 	for index := start / m.ChunkBytes; index <= min(start/m.ChunkBytes+1, end/m.ChunkBytes); index++ {
@@ -634,7 +509,9 @@ func (s *Server) serveBlocks(w http.ResponseWriter, r *http.Request, root []byte
 		return true
 	}
 	first := start / m.ChunkBytes
-	sub, err := s.openRangeBlock(r, root, parent, m, first, origin, false)
+	cursor := &rangeCursor{s: s, request: r, root: root, parent: parent, object: m, origin: origin, last: end / m.ChunkBytes, segment: -1}
+	defer cursor.close()
+	sub, err := cursor.open(first)
 	if errors.Is(err, errRangeBypass) {
 		s.proxyRangeBypass(w, r, origin)
 		return true
@@ -681,9 +558,12 @@ func (s *Server) serveBlocks(w http.ResponseWriter, r *http.Request, root []byte
 	} else {
 		w.WriteHeader(http.StatusPartialContent)
 	}
+	if err = http.NewResponseController(w).Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		panic(http.ErrAbortHandler)
+	}
 	for index := first; index <= end/m.ChunkBytes; index++ {
 		if index != first {
-			sub, err = s.openRangeBlock(r, root, parent, m, index, origin, false)
+			sub, err = cursor.open(index)
 			if err != nil {
 				panic(http.ErrAbortHandler)
 			}
