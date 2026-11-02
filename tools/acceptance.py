@@ -576,7 +576,7 @@ def functional(args, fixtures, output):
         assert origin.snapshot(path)["get"] == 3
         conditional = [row for row in origin.records if row["path"] == path][-1]
         assert conditional["headers"].get("If-None-Match") == '"small-v1"' and conditional["status"] == 304 and conditional["bytes"] == 0, conditional
-        record("small MISS/HIT/REVALIDATE and conditional passthrough304", origin=origin.snapshot(path))
+        record("small MISS/HIT, forced refresh and conditional passthrough304", origin=origin.snapshot(path))
         for path, headers in [("/small-private", {}), ("/small-auth", {"Authorization": "Bearer test-only"})]:
             origin.rules[path] = {"cache_control": "private, max-age=3600"}
             for _ in range(2):
@@ -754,9 +754,15 @@ def functional(args, fixtures, output):
         product.stop()
         # Verify advertised main-binary cache states actually appeared in access logs.
         access = (output / "functional/access.log").read_text()
-        for state in ("MISS", "HIT", "REVALIDATE", "BYPASS", "PURGE"):
+        for state in ("MISS", "HIT", "BYPASS", "PURGE"):
             assert f'"cache_status":"{state}"' in access, state
-        record("main access-log MISS/HIT/REVALIDATE/BYPASS/PURGE observed")
+        # Eligible partial objects rediscover on no-cache; REVALIDATE belongs to
+        # the legacy complete-object path. Check this actual request sequence.
+        refresh = [json.loads(line) for line in access.splitlines()
+                   if json.loads(line).get("path") == "/small-cache"]
+        assert [(row["status"], row["cache_status"]) for row in refresh] == [
+            (200, "MISS"), (200, "HIT"), (200, "MISS"), (304, "BYPASS")], refresh
+        record("main access-log MISS/HIT/BYPASS/PURGE and partial refresh sequence observed")
 
 def benchmark(args, fixtures, output):
     with ExitStack() as cleanup:
