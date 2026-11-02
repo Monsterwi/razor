@@ -53,11 +53,13 @@ sequenceDiagram
 
 每个请求范围在本块的最后一个字节等待完整验证与完成位发布，避免客户端读满 Content-Length 后正常断开取消对齐填充。普通范围仍提前输出前缀；只有一个字节的范围没有可提前发送的前缀，需等本块验证完成。
 
+连续缺块最多以两个 chunk 合并为一次 Range 回源；每个 chunk 有独立就绪和完成通知，因此首块不会等待下一块。客户端始终按对象绝对偏移裁剪，segment 边界分开规划。头部通过准入后显式发送响应头，再读取可能失败的在途正文，避免复用连接上的客户端把未发送头的中断误判为可自动重试的请求。
+
 ## 配置与回归
 
 Plan A 固定每个 chunk 为 1 MiB、每个 segment 包含 64 个 chunk。兼容配置项 `proxy.config.cache.range_block_bytes` 仅接受 1048576；其他值拒绝加载。
 
-代码：[serveBlocks](../server/range_cache.go)。回归：[首块屏障/共享](../server/rww_test.go)、[淘汰](../server/rww_eviction_test.go)、[版本围栏](../server/range_version_fence_test.go)。
+代码：[serveBlocks](../server/range_cache.go)、[位图与区间规划](../server/range_plan.go)。回归：[跨块/segment/取消](../server/partial_range_test.go)、[首块屏障/共享](../server/rww_test.go)、[淘汰](../server/rww_eviction_test.go)、[版本围栏](../server/range_version_fence_test.go)。
 
 ```bash
 go test ./server -run 'Test(RangeCommittedBlockArrivesBeforeSecondBlock|PublicGETCommittedBlockArrivesBeforeSecondBlock|PublicGETAndOverlappingRangeShareBlockProducers|RangeOnlyFetchesMissingAlignedUnion|CommittedBlockStreamAbortsOnLaterOriginFailure)$' -count=1 -timeout 120s

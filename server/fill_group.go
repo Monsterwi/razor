@@ -28,6 +28,7 @@ type fillGroup struct {
 	tasks                                             map[string]*fillTask
 	producers                                         sync.WaitGroup
 	active, waiters                                   int
+	rangeSequence                                     uint64
 	joined, completed, unshareable, failed, cancelled uint64
 }
 
@@ -93,13 +94,7 @@ func (g *fillGroup) joinLocked(id string, token *cache.FillToken, cfg *config.Co
 	}
 	if task := g.tasks[id]; task != nil {
 		if g.cache.CheckFill(task.token) == nil && task.ctx.Err() == nil {
-			if task.refs >= cfg.SharedFillMaxWaiters {
-				return nil, false, budget.ErrOverloaded
-			}
-			task.refs++
-			g.waiters++
-			g.joined++
-			return task, false, nil
+			return g.attachLocked(task, cfg)
 		}
 		delete(g.tasks, id)
 	}
@@ -116,6 +111,16 @@ func (g *fillGroup) joinLocked(id string, token *cache.FillToken, cfg *config.Co
 	g.waiters++
 	g.producers.Add(1)
 	return task, true, nil
+}
+
+func (g *fillGroup) attachLocked(task *fillTask, cfg *config.Config) (*fillTask, bool, error) {
+	if task.refs >= cfg.SharedFillMaxWaiters {
+		return nil, false, budget.ErrOverloaded
+	}
+	task.refs++
+	g.waiters++
+	g.joined++
+	return task, false, nil
 }
 func (g *fillGroup) leave(task *fillTask, creator bool) {
 	g.mu.Lock()

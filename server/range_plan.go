@@ -26,32 +26,46 @@ type rangeChunk struct {
 
 type rangeRun struct {
 	identity    string
+	object      string
 	first, last int64
 	chunks      [maxRangeRunChunks]rangeChunk
 }
 
 // claimRange atomically joins an interval or reserves a non-overlapping run.
 // A hit already shortened last before this call; an existing owner also cuts it.
-func (g *fillGroup) claimRange(identity string, first, last int64, token *cache.FillToken, cfg *config.Config) (*fillTask, bool, error) {
+func (g *fillGroup) claimRange(identity, object string, first, last int64, token *cache.FillToken, cfg *config.Config) (*fillTask, bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for _, task := range g.tasks {
 		run := task.rangeRun
-		if run == nil || run.identity != identity || task.ctx.Err() != nil || g.cache.CheckFill(task.token) != nil {
+		if run == nil || run.object != object || task.ctx.Err() != nil || g.cache.CheckFill(task.token) != nil {
 			continue
 		}
-		if run.first <= first && first <= run.last {
-			return g.joinLocked(task.id, token, cfg)
-		}
-		if run.first > first && run.first <= last {
-			last = run.first - 1
+		for index := run.first; index <= run.last; index++ {
+			select {
+			case <-run.chunks[index-run.first].done:
+				continue // Completed coverage can be evicted and claimed again.
+			default:
+			}
+			if index == first {
+				if run.identity != identity {
+					return nil, false, errRangeOwnership
+				}
+				return g.attachLocked(task, cfg)
+			}
+			if index > first && index <= last {
+				last = index - 1
+			}
 		}
 	}
-	task, creator, err := g.joinLocked(fmt.Sprintf("range:%s:%d", identity, first), token, cfg)
+	// An older run may still own its next chunk after this prefix completed.
+	// Keep it registered, but never attach a replacement to its completed slot.
+	g.rangeSequence++
+	task, creator, err := g.joinLocked(fmt.Sprintf("range:%s:%d:%d", identity, first, g.rangeSequence), token, cfg)
 	if err != nil || !creator {
 		return task, creator, err
 	}
-	run := &rangeRun{identity: identity, first: first, last: last}
+	run := &rangeRun{identity: identity, object: object, first: first, last: last}
 	for i := first; i <= last; i++ {
 		run.chunks[i-first] = rangeChunk{ready: make(chan struct{}), done: make(chan struct{})}
 	}
@@ -81,6 +95,79 @@ func (c *rangeCursor) close() {
 }
 
 func (c *rangeCursor) open(index int64) (*rangeSubscription, error) {
+	sub, err := c.openChunk(index)
+	reader := &rangeChunkReader{cursor: c, index: index, sub: sub}
+	if err != nil {
+		if err = reader.recover(err); err != nil {
+			reader.close()
+			return nil, err
+		}
+	}
+	return &rangeSubscription{body: reader, close: reader.close, wait: func() error { return reader.sub.wait() }, reused: reader.sub.reused}, nil
+}
+
+// A slow subscriber can outlive the disk's rolling allocation. Recover only a
+// missing local fragment, once, under the original parent and strong validator.
+// Origin errors and version changes are terminal; already sent bytes are skipped.
+// The original cursor retains demand for the following chunk during recovery.
+type rangeChunkReader struct {
+	cursor, recovery *rangeCursor
+	index, offset    int64
+	sub              *rangeSubscription
+}
+
+func (r *rangeChunkReader) recover(err error) error {
+	if r.recovery != nil || !errors.Is(err, cache.ErrNotResident) {
+		return err
+	}
+	if r.sub != nil {
+		if err := r.sub.wait(); err != nil {
+			return err
+		}
+		r.sub.close()
+		r.sub = nil
+	}
+	c := r.cursor
+	if err := c.s.checkRangeVersion(c.root, c.parent, c.object); err != nil {
+		return err
+	}
+	r.recovery = &rangeCursor{s: c.s, request: c.request, root: c.root, parent: c.parent, object: c.object, origin: c.origin, last: r.index, segment: -1}
+	r.sub, err = r.recovery.openChunk(r.index)
+	if err != nil {
+		return err
+	}
+	_, err = io.CopyN(io.Discard, r.sub.body, r.offset)
+	return err
+}
+
+func (r *rangeChunkReader) Read(p []byte) (int, error) {
+	n, err := r.sub.body.Read(p)
+	r.offset += int64(n)
+	if !errors.Is(err, cache.ErrNotResident) {
+		return n, err
+	}
+	if err = r.recover(err); err != nil {
+		return n, err
+	}
+	if n != 0 {
+		return n, nil
+	}
+	n, err = r.sub.body.Read(p)
+	r.offset += int64(n)
+	return n, err
+}
+
+func (r *rangeChunkReader) close() {
+	if r.sub != nil {
+		r.sub.close()
+		r.sub = nil
+	}
+	if r.recovery != nil {
+		r.recovery.close()
+	}
+}
+
+func (c *rangeCursor) openChunk(index int64) (*rangeSubscription, error) {
 	if c.task != nil && index >= c.task.rangeRun.first && index <= c.task.rangeRun.last {
 		return c.subscribe(index)
 	}
@@ -127,8 +214,9 @@ func (c *rangeCursor) open(index int64) (*rangeSubscription, error) {
 	identityRequest := request.Clone(request.Context())
 	identityRequest.Header.Del("Range")
 	identityRequest.Header.Del("If-Range")
-	identity := fillIdentity(identityRequest, rangeBlockKey(c.root, c.object, 0), resources.version)
-	task, creator, err := c.s.fills.claimRange(identity, index, last, token, resources.config)
+	objectKey := rangeBlockKey(c.root, c.object, 0)
+	identity := fillIdentity(identityRequest, objectKey, resources.version)
+	task, creator, err := c.s.fills.claimRange(identity, string(objectKey), index, last, token, resources.config)
 	if err != nil {
 		resources.release()
 		return nil, err
@@ -183,7 +271,16 @@ func (c *rangeCursor) subscribe(index int64) (*rangeSubscription, error) {
 			return chunk.err
 		}
 	}
-	if chunk.writer == nil {
+	completed := false
+	select {
+	case <-chunk.done:
+		if chunk.err != nil {
+			return nil, chunk.err
+		}
+		completed = true
+	default:
+	}
+	if completed {
 		data, _, release, err := c.s.readRangeBlock(c.request, rangeBlockKey(c.root, c.object, index), c.object, index, false)
 		if err != nil {
 			return nil, err
