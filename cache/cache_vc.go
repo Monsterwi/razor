@@ -102,6 +102,32 @@ func newCacheVCWriteLocked(ctx context.Context, token *FillToken) (*CacheVC, err
 
 func (vc *CacheVC) IsRWW() bool { return vc.reading && vc.reader != nil && vc.reader.writer != nil }
 
+// OpenReader subscribes to this exact writer, including after it has finished.
+// A replacement writer for the same key can never supply this reader's bytes.
+// The caller owns the returned reader and must close it.
+func (vc *CacheVC) OpenReader(ctx context.Context) (*CacheVC, error) {
+	if !vc.writing || vc.writer == nil {
+		return nil, fmt.Errorf("no writer to subscribe to")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	vc.Stripe.mu.Lock()
+	if vc.Stripe.closing || vc.generation != vc.Stripe.OpenDir.Generation() {
+		vc.Stripe.mu.Unlock()
+		return nil, ErrInvalidated
+	}
+	vc.entry.mutex.Lock()
+	vc.entry.RefCount++
+	vc.entry.mutex.Unlock()
+	vc.Stripe.mu.Unlock()
+	readCtx, cancel := context.WithCancel(ctx)
+	reader := NewCacheReaderFromWriter(vc.Stripe, vc.Key, vc.writer)
+	reader.ctx = readCtx
+	return &CacheVC{Stripe: vc.Stripe, Key: append([]byte(nil), vc.Key...), reading: true,
+		reader: reader, entry: vc.entry, generation: vc.generation, done: readCtx.Done(), readCancel: cancel}, nil
+}
+
 func (vc *CacheVC) WaitForHeaders(timeout time.Duration) error {
 	if !vc.IsRWW() {
 		return nil

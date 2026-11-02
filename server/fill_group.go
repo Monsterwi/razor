@@ -20,7 +20,7 @@ import (
 var errUnshareable = errors.New("origin response is not shareable")
 
 // fillGroup owns pre-origin tasks. OpenDir starts only after a real writer exists.
-// Bodies stay with a producer until committed, or go exclusively to its creator.
+// Admitted bodies stream through the cache writer; private bodies go only to the creator.
 type fillGroup struct {
 	mu                                                sync.Mutex
 	ctx                                               context.Context
@@ -39,6 +39,8 @@ type fillTask struct {
 	refs                                   int
 	done, creatorGone, privateDone, exited chan struct{}
 	private                                chan *http.Response
+	streamReady                            chan struct{}
+	stream                                 *cache.CacheVC
 	result                                 fillResult
 }
 
@@ -103,7 +105,7 @@ func (g *fillGroup) join(id string, token *cache.FillToken, cfg *config.Config) 
 		return nil, false, err
 	}
 	ctx, cancel := context.WithTimeout(g.ctx, time.Duration(cfg.SharedFillTimeout)*time.Second)
-	task := &fillTask{id: id, token: token, ctx: ctx, cancel: cancel, refs: 1, done: make(chan struct{}), creatorGone: make(chan struct{}), privateDone: make(chan struct{}), exited: make(chan struct{}), private: make(chan *http.Response)}
+	task := &fillTask{id: id, token: token, ctx: ctx, cancel: cancel, refs: 1, done: make(chan struct{}), creatorGone: make(chan struct{}), privateDone: make(chan struct{}), exited: make(chan struct{}), private: make(chan *http.Response), streamReady: make(chan struct{})}
 	g.tasks[id] = task
 	g.active++
 	g.waiters++
@@ -145,6 +147,11 @@ func (g *fillGroup) finish(task *fillTask) {
 }
 func (task *fillTask) publish(result fillResult) { task.result = result; close(task.done) }
 
+func (task *fillTask) publishStream(writer *cache.CacheVC) {
+	task.stream = writer
+	close(task.streamReady)
+}
+
 func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []byte, token *cache.FillToken) {
 	status := "MISS"
 	defer func() { s.cacheStatus(w, status) }()
@@ -170,12 +177,15 @@ func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []b
 	} else {
 		resources.release()
 	}
+	streaming := false
 	select {
 	case <-r.Context().Done():
 		return
+	case <-task.streamReady:
+		streaming = true
 	case <-task.done:
 	}
-	if creator && errors.Is(task.result.err, errUnshareable) {
+	if !streaming && creator && errors.Is(task.result.err, errUnshareable) {
 		status = "BYPASS"
 		select {
 		case resp := <-task.private:
@@ -197,7 +207,7 @@ func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []b
 		}
 		return
 	}
-	if task.result.err != nil {
+	if !streaming && task.result.err != nil {
 		status := http.StatusBadGateway
 		if errors.Is(task.result.err, errUnshareable) || errors.Is(task.result.err, budget.ErrOverloaded) {
 			status = http.StatusServiceUnavailable
@@ -215,7 +225,12 @@ func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []b
 		http.Error(w, "Cache fill invalidated", http.StatusServiceUnavailable)
 		return
 	}
-	vc, err := s.cache.OpenReadCommitted(task.result.key)
+	var vc *cache.CacheVC
+	if streaming {
+		vc, err = task.stream.OpenReader(r.Context())
+	} else {
+		vc, err = s.cache.OpenReadCommitted(task.result.key)
+	}
 	if err != nil {
 		http.Error(w, "Completed object unavailable", http.StatusBadGateway)
 		return
@@ -228,12 +243,12 @@ func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []b
 	}
 	fields, valid := varyFields(info.ResponseHeaders)
 	policy, safe := responsePolicy(info, s.now())
-	if !valid || !safe || string(representationKey(key, r.Header, fields)) != string(task.result.key) {
+	if !valid || !safe || string(representationKey(key, r.Header, fields)) != string(vc.Key) {
 		http.Error(w, "Completed object unavailable", http.StatusBadGateway)
 		return
 	}
 
-	if task.result.status != "" {
+	if !streaming && task.result.status != "" {
 		status = task.result.status
 	}
 	s.serveCacheHit(w, r, vc, info, policy)

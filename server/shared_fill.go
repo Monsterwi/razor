@@ -123,6 +123,7 @@ func (s *Server) fetchFill(task *fillTask, r *http.Request, key []byte, resource
 		vc.SetHTTPInfo(info)
 		fill := &cacheFill{vc: vc, cancel: cacheCancel, timeout: time.Duration(resources.config.CacheWriteTimeout) * time.Second, limit: int64(resources.config.MaxCacheObjectBytes), stats: &s.counters}
 		defer fill.abort(errors.New("cache fill incomplete"))
+		task.publishStream(vc)
 		buf := make([]byte, 32*1024)
 		for {
 			n, readErr := resp.RawBody().Read(buf)
