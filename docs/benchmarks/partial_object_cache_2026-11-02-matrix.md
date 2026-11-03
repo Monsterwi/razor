@@ -1,6 +1,6 @@
 # Plan A 规格与验收映射
 
-本附录按 [规格 #37](https://github.com/Monsterwi/razor/issues/37) 的 15 行 HTTP 矩阵、34 条 User Stories 与 35 条 Implementation Decisions 逐项映射测试。固定源码、二进制摘要、完整命令退出码和成本数据见[验收报告](partial_object_cache_2026-11-02.md)与[紧凑证据](partial_object_cache_2026-11-02.json)。本轮语义与名称核对基于 `6260620573d0fe601e51d83249a03878dd120ed8`，并采用 [2026-11-03 ADR](../adr/0001-partial-object-caching-plan-a.md) 的响应完成与独立当前块边界。当前 JSON/CSV 仍是旧 a37 历史原值；新固定版本专机结果待填，不以映射或旧附件代替最终验收。
+本附录按 [规格 #37](https://github.com/Monsterwi/razor/issues/37) 的 15 行 HTTP 矩阵、34 条 User Stories 与 35 条 Implementation Decisions 逐项映射测试。固定源码、二进制摘要、完整命令退出码和成本数据见[验收报告](partial_object_cache_2026-11-02.md)与[紧凑证据](partial_object_cache_2026-11-02.json)。本轮语义与名称核对基于 `6260620573d0fe601e51d83249a03878dd120ed8`，并采用 [2026-11-03 ADR](../adr/0001-partial-object-caching-plan-a.md) 的响应完成与独立当前块边界。当前 JSON/CSV 均为该固定版本的新专机数据；最终测试同步修正 ef41a50 与其生产二进制相同。完整验证结果和边界见主报告，最终整分支审查由主交付流程另行记录。
 
 Go TCP 用例通过 `httptest.NewServer`、HTTP 客户端与本地源站传输，但 handler 在测试进程内；Python `Product` 用例启动独立 Razor 进程。缓存 API 仅补故障、竞争与恢复。`TestRangeBoundariesAndIfRange`、`TestRangeRawEncodingVariantsKeepIndependentBlocks`、`TestPurgeFencesOriginRequestBeforeHeaders` 使用前端 Recorder，作为补充，不冒称独立 TCP/进程验收。
 
@@ -66,8 +66,8 @@ Go TCP 用例通过 `httptest.NewServer`、HTTP 客户端与本地源站传输�
 | 30 无准入/不支持请求正确透传 | M10、M5 | 头部保留、正确正文/状态、源请求次数排除错误缓存。 |
 | 31 identity/admission | M10 | Host、原始 query 顺序、origin、language/encoding、freshness。 |
 | 32 有界缓冲/受控工作 | `TestPublicGET100MiBThroughMinimumBudgetAndDiskWindow`、`TestSharedGETSlowCreatorDoesNotBackpressureOtherSubscriber`、`TestS3ConcurrentSlowRangeSurvivesRepeatedDiskWrap`、`TestSharedFillBudgetsRejectWithoutOriginRetry` | 100 MiB 经 32 MiB 磁盘与最低 writer reservation 完整 SHA；response buffer allocation 不超容量；慢读并发滚盘以及超预算不额外回源。只能证明这些有界配置/负载，不是任意规模 heap 上限证明。 |
-| 33 HTTP 级正确性证据 | M1–M15 | TCP bytes/headers/origin/gate 和独立进程验证齐备；必须填入本轮实际执行结果。 |
-| 34 流量与缓存开销分别测量 | `public_benchmark`、`Client.batch`、`BenchmarkPartialCoverage`；#46 专用机正式测量 | 新固定版本专机 HDD/SSD 各69组及metadata三轮待完成；新增客户端/填充收尾/完整观测窗口，源字节统计到fill结束，旧a37原值不替代新测量。 |
+| 33 HTTP 级正确性证据 | M1–M15 | TCP bytes/headers/origin/gate 和独立进程验证齐备；本轮实际执行结果已在 JSON 记录。 |
+| 34 流量与缓存开销分别测量 | `public_benchmark`、`Client.batch`、`BenchmarkPartialCoverage`；#46 专用机正式测量 | 6260620 专机 HDD/SSD 各69组及metadata三轮已完成；共40,468响应零错误，完整源字节统计到fill结束，138行客户端/收尾/观测窗口均已复算。 |
 
 ## Implementation Decisions 全量核对（I01–I35）
 
@@ -78,7 +78,7 @@ Go TCP 用例通过 `httptest.NewServer`、HTTP 客户端与本地源站传输�
 | I01 segment 是对象逻辑范围；不是目录 partition，chunk 不是 fragment | `GLOSSARY.md`、ADR 0001；`cache/partial_object.go` 按对象 index 派生 key，底层仍走 CacheVC/fragment | 结构/术语约束；M1 跨 segment 精确内容佐证逻辑分组。不能由它推导数据连续落盘。 |
 | I02 固定 1 MiB × 64，短尾按已知长度完整校验 | `PartialChunkBytes`、`PartialSegmentChunks`；`config/limits.go` 拒绝非 1 MiB；`fillGETChunk`/`fetchRangeRun` 使用对象末端长度 | `TestRangeBlockConfiguration` 检查配置；M1 几何/短尾、小空对象；M8/单字节测试 短体不能成为完整缓存。保留旧配置项但仅允许固定值，不是新增调参能力。 |
 | I03 versioned object/segment 元数据，数据可归属 generation/index/有效长度 | `PartialObject` 保存 version/geometry/total/ETag/origin/variant/generation；segment 保存 identity/index/coverage；`ChunkKey` + 每块 Content-Range/Length | M9、M11、M15 验证版别/代次/格式隔离；M1/M8 验证长度。覆盖不是客户端请求相对分片号。 |
-| I04 64 bit 只算 coverage；metadata 按需、有界 | `PartialCoverage` 每次读一个有界记录；`readPartialRecord` 限 64 KiB；`Cache.partialLocks` 固定 64 把；复用有容量的 RAM/disk cache | 无每对象常驻 bitmap map 的源码约束可确认。Story 32 只证明选定负载下缓冲受控；新固定样例的目录/metadata/RSS 成本待专机测量；大规模趋势未测，不能声称总开销 8 bytes/segment。 |
+| I04 64 bit 只算 coverage；metadata 按需、有界 | `PartialCoverage` 每次读一个有界记录；`readPartialRecord` 限 64 KiB；`Cache.partialLocks` 固定 64 把；复用有容量的 RAM/disk cache | 无每对象常驻 bitmap map 的源码约束可确认。Story 32 只证明选定负载下缓冲受控；新固定样例的目录/metadata/RSS 成本已记录于主报告及 JSON；大规模趋势未测，不能声称总开销 8 bytes/segment。 |
 | I05 object/segment/data namespace 分离；generation 与 ETag 不同 | `PartialObjectKey`、`segmentKey`、`ChunkKey` 使用各自 versioned namespace，identity 含独立随机 Generation；底层 `docKey` 哈希完整身份 | M3/M4 复用同 chunk 体系；M11/M15 保证同 URL/ETag 失效隔离及旧 namespace 不被误读。不宣称沿用旧整对象记录。 |
 | I06 拒绝不兼容格式，不迁移、不删无关文件/store | `ReadPartialObject`、`readPartialCoverage` 与 checkpoint 解码校验 | M15 `TestPartialRecoveryRejectsOldFormatsWithoutChangingUnrelatedFiles`。 |
 | I07 强 ETag、已知长度、共享资格才准入；open/suffix 支持，其他透传 | `rangeEligible`、`strongRangeTag`、`ensureRangeObject`、`fetchFill` | M1/M5/M10；重复请求和源站记录证明不误缓存。 |
@@ -109,7 +109,7 @@ Go TCP 用例通过 `httptest.NewServer`、HTTP 客户端与本地源站传输�
 | I32 exact/prefix 包括稀疏/仅在途对象；失败不报成功 | selector invalidation 与原子 fence，不按连续 chunk 编号删到首洞为止 | `TestPartialPurgeSparseExactAndPrefixLeaveOtherObjects`、`TestPartialPurgeFailureCannotReturnSuccess`；独立进程 purge/恢复矩阵。通用 pre-header case 是 Recorder 补充。 |
 | I33 正常保存/恢复可靠，处理 user buffer、顺序、durability 错误、内容验证 | `Stripe.Close` 排空→data Sync→checkpoint temp write/Sync→Rename→dir Sync；load/record 校验 | M13/M14；跨 stripe 保存失败时 metadata 仅保留 coverage 提示，required data 读验证失败并 repair，不当有效 HIT。data Sync/Rename 已注入；temp-file Sync/dir Sync 未分别注入，是明确覆盖边界。 |
 | I34 异常退出不确定状态可整体失效，无需逐块抢救/同步 durability | checkpoint clean/session/CRC/格式校验，异常 session 不接受旧 clean checkpoint | M14 的 7 窗口与真实进程 kill；不声称断电硬件级验证或保留全部 HIT。 |
-| I35 handler 至持久化整个正确性链在范围内，复用 RAM/aggregate/disk | 当前修改贯穿 handler、fill group、reader/writer、OpenDir/DirMgr、invalidation/checkpoint；继续使用两种 RAM 策略与现有 stripe | M1–M15；两 RAM 的真实进程矩阵、全仓 Go/race 已在本次完整执行中通过，日志摘要见 JSON。无新增生产调试端点；本轮不做无关引擎重写。 |
+| I35 handler 至持久化整个正确性链在范围内，复用 RAM/aggregate/disk | 当前修改贯穿 handler、fill group、reader/writer、OpenDir/DirMgr、invalidation/checkpoint；继续使用两种 RAM 策略与现有 stripe | M1–M15；两 RAM 的真实进程矩阵、全仓 Go、cache/server 完整 race 已在本次执行中通过，日志摘要见 JSON。无新增生产调试端点；本轮不做无关引擎重写。 |
 
-核对结果：35 条都已映射。原 15 场景表未显式表达的 I01–I06、I20/I24/I25/I28 由上表补齐，并未据此发现新的整类实现空缺。I04 的新固定样例成本与 Story 34 的正式测量待记录；任意规模趋势未测；I33 的两个独立 Sync 故障点只可标“未分别注入”。这些边界不能由源码、测试名称存在或全仓构建成功替代。
+核对结果：35 条都已映射。原 15 场景表未显式表达的 I01–I06、I20/I24/I25/I28 由上表补齐，并未据此发现新的整类实现空缺。I04 的新固定样例成本与 Story 34 的正式测量已记录；任意规模趋势未测；I33 的两个独立 Sync 故障点只可标“未分别注入”。这些边界不能由源码、测试名称存在或全仓构建成功替代。
 
