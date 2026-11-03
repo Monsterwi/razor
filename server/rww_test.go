@@ -490,8 +490,11 @@ func TestCommittedBlockStreamAbortsOnLaterOriginFailure(t *testing.T) {
 	}
 }
 
-func TestCommittedBlockClientCancellationStopsPrefetch(t *testing.T) {
-	entered, cancelled := make(chan struct{}), make(chan struct{})
+func TestDisconnectedMergedFillDoesNotStartAnotherRun(t *testing.T) {
+	entered, finished := make(chan struct{}), make(chan struct{})
+	release := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
 	data := bytes.Repeat([]byte("p"), 4<<20)
 	var third atomic.Int32
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -500,11 +503,17 @@ func TestCommittedBlockClientCancellationStopsPrefetch(t *testing.T) {
 		if start, end, ok := originInterval(r); ok && (start >= 2<<20 || end >= 2<<20) {
 			third.Add(1)
 		}
+		if r.Method == http.MethodGet {
+			defer close(finished)
+		}
 		out := &originBoundaryWriter{ResponseWriter: w, boundary: 1 << 20, cross: func() error {
 			close(entered)
-			<-r.Context().Done()
-			close(cancelled)
-			return r.Context().Err()
+			select {
+			case <-release:
+				return nil
+			case <-r.Context().Done():
+				return r.Context().Err()
+			}
 		}}
 		http.ServeContent(out, r, "body", time.Time{}, bytes.NewReader(data))
 	}))
@@ -530,10 +539,12 @@ func TestCommittedBlockClientCancellationStopsPrefetch(t *testing.T) {
 		t.Fatal("second chunk never reached source gate")
 	}
 	resp.Body.Close()
+	waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillWaiters == 0 })
+	unblock()
 	select {
-	case <-cancelled:
+	case <-finished:
 	case <-time.After(3 * time.Second):
-		t.Fatal("cancelled client retained merged fill")
+		t.Fatal("current chunk fill did not finish after disconnect")
 	}
 	if third.Load() != 0 {
 		t.Fatalf("fetched outside requested interval: %d", third.Load())

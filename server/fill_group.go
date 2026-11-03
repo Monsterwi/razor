@@ -39,7 +39,8 @@ type fillTask struct {
 	ctx                                    context.Context
 	cancel                                 context.CancelFunc
 	refs                                   int
-	fillingChunk                           bool // Protected by fillGroup.mu.
+	fillingChunk                           bool  // Protected by fillGroup.mu.
+	fillingIndex                           int64 // Protected by fillGroup.mu.
 	done, creatorGone, privateDone, exited chan struct{}
 	private                                chan *http.Response
 	streamReady                            chan struct{}
@@ -147,7 +148,7 @@ func (g *fillGroup) leave(task *fillTask, creator bool) {
 	}
 }
 
-func (g *fillGroup) beginPartialChunk(task *fillTask) error {
+func (g *fillGroup) beginPartialChunk(task *fillTask, index int64) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if task.refs == 0 {
@@ -156,7 +157,7 @@ func (g *fillGroup) beginPartialChunk(task *fillTask) error {
 	if err := task.ctx.Err(); err != nil {
 		return err
 	}
-	task.fillingChunk = true
+	task.fillingChunk, task.fillingIndex = true, index
 	return nil
 }
 

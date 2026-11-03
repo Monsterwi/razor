@@ -113,6 +113,35 @@ func (g *fillGroup) claimRange(identity, object string, first, last int64, token
 	return task, true, nil
 }
 
+// Waiters observe publication without subscribing to another request identity.
+func (g *fillGroup) pendingPartialChunk(object string, index int64) <-chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, task := range g.tasks {
+		if !task.fillingChunk || task.fillingIndex != index {
+			continue
+		}
+		var chunk *rangeChunk
+		if run := task.rangeRun; run != nil && run.object == object && index >= run.first && index <= run.last {
+			chunk = &run.chunks[index-run.first]
+		} else if p := task.partial; p != nil && p.full && p.key == object {
+			p.mu.Lock()
+			if p.index == index {
+				chunk = p.chunk
+			}
+			p.mu.Unlock()
+		}
+		if chunk != nil {
+			select {
+			case <-chunk.done:
+			default:
+				return chunk.done
+			}
+		}
+	}
+	return nil
+}
+
 type rangeCursor struct {
 	s        *Server
 	request  *http.Request
@@ -231,6 +260,19 @@ func (c *rangeCursor) openChunk(index int64) (*rangeSubscription, error) {
 	mask := uint64(1) << uint(index%cache.PartialSegmentChunks)
 	if c.coverage.Bits&mask != 0 {
 		data, info, release, err := c.s.readRangeBlock(c.request, rangeBlockKey(c.root, c.object, index), c.object, index, false)
+		if c.started && (errors.Is(err, cache.ErrWriteInProgress) || errors.Is(err, cache.ErrNotResident)) {
+			if done := c.s.fills.pendingPartialChunk(string(rangeBlockKey(c.root, c.object, 0)), index); done != nil {
+				select {
+				case <-c.request.Context().Done():
+					return nil, c.request.Context().Err()
+				case <-c.s.fills.ctx.Done():
+					return nil, c.s.fills.ctx.Err()
+				case <-done:
+				}
+			}
+			// The replacement can retire between the failed read and the task snapshot.
+			data, info, release, err = c.s.readRangeBlock(c.request, rangeBlockKey(c.root, c.object, index), c.object, index, false)
+		}
 		if err == nil && c.s.rangeBlockFresh(c.request, info) {
 			return &rangeSubscription{body: bytes.NewReader(data), close: release, wait: func() error { return nil }, reused: true}, nil
 		}
@@ -427,7 +469,7 @@ func (s *Server) fetchRangeRun(task *fillTask, request *http.Request, root []byt
 	}
 	defer s.fills.endPartialChunk(task)
 	for index := first; index <= last; index++ {
-		if err := s.fills.beginPartialChunk(task); err != nil {
+		if err := s.fills.beginPartialChunk(task, index); err != nil {
 			return err
 		}
 		chunkStart := index * m.ChunkBytes
