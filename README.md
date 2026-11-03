@@ -32,7 +32,7 @@ CONFIG proxy.config.cache.range_block_bytes INT 1048576
 
 ## 文档与验证
 
-[UML 架构](docs/architecture.md) · [缓存设计](docs/cache_design.md) · [合并回源时序](docs/cache_fill_design.md) · [RWW](docs/rww_implementation.md) · [实现状态](docs/implementation_status.md)
+[Partial Object Cache 设计](docs/partial_object_cache.md) · [UML 架构](docs/architecture.md) · [缓存设计](docs/cache_design.md) · [合并回源时序](docs/cache_fill_design.md) · [RWW](docs/rww_implementation.md) · [实现状态](docs/implementation_status.md)
 
 ```bash
 make test
