@@ -16,7 +16,7 @@
 | --- | --- | --- |
 | fresh 整对象 HIT | 已提交表示 | 校验读取后 |
 | 普通整对象 MISS | 整对象任务与确切 writer | 共享头部通过准入、所需字节到达后 |
-| 单 Range / 合格普通 GET | 对象元数据、segment 位图和在途块区间 | 响应头校验后流式发送所需字节；响应可先完成，当前块独立收尾后才置位 |
+| 单 Range / 合格普通 GET | 对象、segment 位图、chunk 及在途区间 | 校验响应头、所需字节到达后，见 [Partial Object Cache](partial_object_cache.md) |
 | 不可缓存请求 | 普通代理 | 按代理语义透传 |
 
 ## 生命周期与边界
@@ -32,7 +32,7 @@
 
 缓存层的对象模型、磁盘布局和读写路径见 [缓存设计](cache_design.md)。
 
-设计入口：[合并与块缓存](cache_fill_design.md) · [RWW](rww_implementation.md) · [RAM](ram_cache.md) · [存储恢复](cache_storage_format.md)。
+设计入口：[部分对象缓存](partial_object_cache.md) · [任务与身份](cache_fill_design.md) · [RWW](rww_implementation.md) · [RAM](ram_cache.md) · [存储恢复](cache_storage_format.md)。
 
 [PlantUML 图源与 SVG](diagrams/)同目录保存（渲染工具 1.2026.9）；修改图源后重新生成。仅在本机渲染，不依赖在线 UML 服务：
 
