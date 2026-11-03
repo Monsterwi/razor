@@ -2,9 +2,11 @@ package server_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -361,11 +363,21 @@ func TestCacheCommitFailureDoesNotPublishOrigin(t *testing.T) {
 }
 
 func TestSlowUploadCannotHoldOriginOrHandlerAfterEarlyResponse(t *testing.T) {
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var originErrors bytes.Buffer
+	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The early response abandons the upload, so this connection cannot be reused.
+		w.Header().Set("Connection", "close")
 		http.NewResponseController(w).EnableFullDuplex()
 		io.WriteString(w, "early")
 	}))
-	defer origin.Close()
+	origin.Config.ErrorLog = log.New(&originErrors, "", 0)
+	origin.Start()
+	defer func() {
+		origin.Close()
+		if originErrors.Len() != 0 {
+			t.Errorf("origin errors: %s", originErrors.String())
+		}
+	}()
 	cfg := appconfig.GetDefaultConfig()
 	cfg.TransactionTimeoutIn = 1
 	cfg.LogfileDir = t.TempDir()
