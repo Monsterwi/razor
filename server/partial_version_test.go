@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Monsterwi/razor/server"
 )
 
 func TestLateOldRangeFailureCannotFenceNewGeneration(t *testing.T) {
@@ -131,6 +133,8 @@ func TestLateOldRangeFailureCannotFenceNewGeneration(t *testing.T) {
 			if mode == "same-generation-refreshed" {
 				wantGets = 4
 			}
+			// Response EOF can precede the detached tail's cache publication.
+			waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillTasks == 0 && st.CacheWriters == 0 })
 			after := rangeHTTP(t, client, front.URL+"/version", chunk, len(newer)-1)
 			body, err := io.ReadAll(after.Body)
 			after.Body.Close()
