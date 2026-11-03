@@ -51,6 +51,7 @@ func objectReplacementStream(t *testing.T, changedVersion bool) {
 	if warm.Code != 206 || !bytes.Equal(warm.Body.Bytes(), old) {
 		t.Fatal("warm failed")
 	}
+	waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillTasks == 0 && st.CacheWriters == 0 })
 	entered, resume := make(chan struct{}), make(chan struct{})
 	var release sync.Once
 	defer release.Do(func() { close(resume) })
@@ -98,6 +99,7 @@ func objectReplacementStream(t *testing.T, changedVersion bool) {
 	if changed.Code != 206 || !bytes.Equal(changed.Body.Bytes(), expected) {
 		t.Fatalf("replacement status=%d bytes=%d", changed.Code, changed.Body.Len())
 	}
+	waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillTasks == 0 && st.CacheWriters == 0 })
 	beforeResume := gets.Load()
 	release.Do(func() { close(resume) })
 	select {
