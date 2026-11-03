@@ -160,6 +160,7 @@ def purge_active_response(product, origin, client, full=False, prefix=False, ret
             new_gate.set()
             assert finish(new, new_first) == client.expected(path, version=2)
         wait_for(lambda: all("end" in row for row in origin.records if row["path"] == path), "both generations' origin requests finished")
+        drain(product)
         before = origin.snapshot(path)
         repair_bytes = 0
         if full:
@@ -319,26 +320,35 @@ def public_functional(args, fixtures, output, smoke=False):
         # Last subscriber cancellation while the merged response is held inside its body.
         path = "/large-last-cancel"
         entered, gate = threading.Event(), threading.Event()
-        origin.rules[path] = {"body_gate_at": block, "entered": entered, "gate": gate}
+        gate_at = block + (16 << 10)
+        origin.rules[path] = {"body_gate_at": gate_at, "entered": entered, "gate": gate}
         c = http.client.HTTPConnection("127.0.0.1", product.port, timeout=8)
         try:
             c.request("GET", path, headers={"Host": "bench.local", "Accept-Encoding": "identity", "Range": f"bytes=0-{3 * block - 1}"})
             response = c.getresponse()
-            prefix = response.read(block)
-            assert len(prefix) == block and entered.wait(5)
+            prefix = response.read(gate_at)
+            assert len(prefix) == gate_at and entered.wait(5)
             c.sock.shutdown(socket.SHUT_RDWR)
             response.close()
             c.close()
-            final = drain(product)
+            wait_for(lambda: snapshot(product)["stats"]["InFlight"] == 0, "last reader handler released")
             held = origin.snapshot(path)
-            assert held["get"] == 1 and held["bytes"] == block, held
+            assert held["get"] == 1 and held["bytes"] == gate_at, held
         finally:
             gate.set()
             c.close()
+        final = drain(product)
+        wait_for(lambda: all("end" in row for row in origin.records if row["path"] == path), "cancelled reader's current chunk finished")
+        completed = origin.snapshot(path)
+        assert completed == {"requests": 2, "get": 1, "head": 1, "bytes": 2 * block}, completed
+        client.checked(product, path, headers={"Range": f"bytes=0-{2 * block - 1}"}, status=206,
+                       expected=client.expected(path, bounds=(0, 2 * block - 1)))
+        assert origin.snapshot(path) == completed, "current chunk was discarded after last reader left"
         assert final["stats"]["HeapAlloc"] > 0 and "GCCount" in final["stats"]
-        assert origin.snapshot(path)["get"] == 1, origin.snapshot(path)
-        record(output, evidence, "reader cancellation stops merged run and drains", drain=final, origin_before_release=held)
+        record(output, evidence, "reader cancellation completes current chunk, stops before next and drains", drain=final,
+               origin_before_release=held, origin_after_completion=completed)
         # Clean restart reuses committed blocks; PURGE forces a new generation.
+        drain(product)
         path = "/large-union"
         before = origin.snapshot(path)
         product.stop()
@@ -353,6 +363,7 @@ def public_functional(args, fixtures, output, smoke=False):
         product.reload({"http.health.interval": ("INT", 1), "http.health.failures": ("INT", 1), "http.health.successes": ("INT", 1)})
         # Establish the block through the current runtime before removing the origin.
         client.checked(product, path, headers={"Range": f"bytes=0-{block - 1}"}, status=206, expected=expected)
+        drain(product)
         origin.healthy = False
         wait_for(lambda: client.request(product, "/small-health-probe", headers={"Authorization": "Bearer probe"}, status=None)["status"] == 502,
                  "all origins unhealthy", 10)

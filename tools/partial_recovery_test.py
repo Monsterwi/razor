@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import unittest
 
 from acceptance import Client, MIB, Origin, Product, create_fixtures, wait_for
-from public_acceptance import purge_active_response
+from public_acceptance import drain, purge_active_response
 
 
 @unittest.skipUnless(os.environ.get("RAZOR_ACCEPTANCE_BINARY"), "set RAZOR_ACCEPTANCE_BINARY for real process recovery")
@@ -38,6 +38,8 @@ class PartialRecoveryTest(unittest.TestCase):
         self.assertEqual(response["etag"], f'"large-v{version}"')
         self.assertEqual(response["content-length"], str(self.total if bounds is None else bounds[1] - bounds[0] + 1))
         self.assertEqual(response.get("content-range"), None if bounds is None else f"bytes {bounds[0]}-{bounds[1]}/{self.total}")
+        # Recovery assertions observe completed cache state, not just client EOF.
+        drain(self.product)
         return row
 
     def restart(self, crash=False):

@@ -1,8 +1,10 @@
 """Client completion and independent current-chunk cache completion over real HTTP."""
+import concurrent.futures
 from contextlib import ExitStack
 import hashlib
 import http.client
 import io
+import json
 import os
 from pathlib import Path
 import socket
@@ -22,6 +24,7 @@ class SingleByteRangeTest(unittest.TestCase):
         self.cleanup = ExitStack()
         self.addCleanup(self.cleanup.close)
         root = Path(self.cleanup.enter_context(tempfile.TemporaryDirectory()))
+        self.root = root
         self.total = 3 * MIB + 37
         fixtures = create_fixtures(root / "fixtures", self.total)
         self.origin = Origin(fixtures, root / "origin.json")
@@ -100,6 +103,38 @@ class SingleByteRangeTest(unittest.TestCase):
         self.assertEqual(self.origin_ranges(path), [f"bytes=0-{MIB - 1}"])
         self.checked_range(path, (0, MIB - 1))
         self.assertEqual(self.origin.snapshot(path), before, "completed chunk was not retained after clients left")
+
+    def test_batch_counts_independent_fill_after_client_completion(self):
+        path = "/large-measured-early-byte"
+        entered, gate = self.held_origin(path)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(self.client.batch, self.product, self.origin, "early-byte", path, 1,
+                                     count=1, bounds=(7, 7), headers={"Range": "bytes=7-7"})
+                try:
+                    self.assertTrue(entered.wait(5))
+                    def client_finished():
+                        rows = [json.loads(line) for line in (self.root / "requests.jsonl").read_text().splitlines(keepends=True) if line.endswith("\n")]
+                        return any(row["case"] == "early-byte" and row["bytes"] == 1 and not row["error"] for row in rows)
+                    wait_for(client_finished, "one-byte client completed before origin tail")
+                    self.assertFalse(gate.is_set())
+                    self.assertEqual(self.origin.snapshot(path)["bytes"], 16 << 10)
+                    # The response is complete; accounting must still wait for its fill.
+                    with self.assertRaises(concurrent.futures.TimeoutError):
+                        future.result(timeout=.1)
+                finally:
+                    gate.set()
+                measured = future.result(timeout=5)
+        finally:
+            gate.set()
+        self.assertEqual(measured["response_body_bytes"], 1)
+        self.assertEqual(measured["origin"], {"requests": 2, "get": 1, "head": 1, "bytes": MIB})
+        self.assertEqual(measured["origin_body_bytes_per_response_byte"], MIB)
+        self.assertGreater(measured["fill_settle_seconds"], 0)
+        self.assertGreater(measured["observation_seconds"], measured["seconds"])
+        hot = self.client.batch(self.product, self.origin, "early-byte-hot", path, 1,
+                               count=1, bounds=(7, 7), headers={"Range": "bytes=7-7"})
+        self.assertEqual(hot["origin"], {"requests": 0, "get": 0, "head": 0, "bytes": 0})
 
     def test_disconnected_last_reader_still_completes_current_chunk(self):
         path = "/large-disconnected-byte-reader"
