@@ -215,6 +215,7 @@ func TestRangeCorruptCacheFailsSafelyOfflineAfterRestart(t *testing.T) {
 			if got := fetch(s, "http://cache.test/item", http.Header{"Range": {"bytes=0-100"}}); got.Code != 206 {
 				t.Fatal(got.Code)
 			}
+			waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillTasks == 0 && st.CacheWriters == 0 })
 			if err := s.Shutdown(); err != nil {
 				t.Fatal(err)
 			}
@@ -224,7 +225,7 @@ func TestRangeCorruptCacheFailsSafelyOfflineAfterRestart(t *testing.T) {
 			}
 			needle := []byte("offline-corruption-payload-")
 			if record == "manifest" {
-				needle = []byte(`"Version":2,"BlockSize":1048576`)
+				needle = []byte(`"Version":3,"ChunkBytes":1048576`)
 			}
 			buf := make([]byte, 64<<10)
 			found := false

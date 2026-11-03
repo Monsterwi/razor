@@ -4,7 +4,7 @@
 
 ## 发布状态
 
-下图是逻辑状态，不是代码中的枚举。完整对象、manifest、每个逻辑块共用提交边界。
+运行时提交顺序为：完整校验 → 数据目录 → segment 完成位。RWW 的临时可读字节不等于普通缓存命中；响应完成与块提交的关系见 [RWW](rww_implementation.md)，三类内部记录见 [Partial Object Cache](partial_object_cache.md)。
 
 ![UML 缓存发布状态图](diagrams/publication.svg)
 
@@ -16,6 +16,7 @@
 | Doc | v3；72 B 头；IEEE CRC32 覆盖 checksum 置零的序列化头、元数据、正文 |
 | 片段身份 | 完整逻辑键/首键摘要、writer、片段位置和长度独立校验；非头 TotalLen 为逻辑结束偏移，头为总长 |
 | Checkpoint | v1；`<data path>.<Skip>.checkpoint`；带校验的 geometry、写位置、phase、session、目录、完整键/selector |
+| 部分对象记录 | v3；对象、segment、chunk 使用独立键；固定 1 MiB/chunk、64 chunk/segment；对象版本、缓存代次、块位置和有效长度参与数据身份 |
 | 编码 | 目录字段小端；envelope/字符串长度大端；每条映射编码额外至多 8 B |
 | 限额 | 每键/selector 16 KiB；至多 min(65,536, 目录容量) 条；键/selector 字符串合计 16 MiB |
 | 不兼容/损坏 | missing/dirty/torn/geometry/session 不符均冷 MISS；不扫描旧数据重建、不在线迁移 |
@@ -39,4 +40,18 @@
 
 重开时 Stripe 与聚合写使用同一进程内 allocation generation，保留可表示的前一代，允许旧 phase 对象继续正确失效、刷新和迁移；不改变检查点格式。迁移机制见 [evacuation](evacuation.md)。
 
-验证范围：[提交/回卷](../cache/storage_commit_test.go)、[恢复/损坏/子进程强杀](../cache/recovery_test.go)、[PURGE 后强杀](../cache/invalidation_restart_test.go)。覆盖进程崩溃与文件系统错误，未验证物理断电或恶意伪造 CRC。
+## 部分对象恢复
+
+各 stripe 独立保存，无跨 stripe 事务。恢复的对象元数据或位图只是规划依据；chunk 仍须通过目录、身份、长度和 CRC 校验，丢失时按 MISS 条件修复并补块，不能凭位图返回内容。
+
+正常关闭后可复用 GET/Range 已完成块；异常退出由 session 隔离旧检查点，无法证明一致的 stripe 可整体冷启动。PURGE 私有旧流不进入目录或位图，不能经检查点复活。
+
+| 验收 | 可观察结果 |
+| --- | --- |
+| 跨 stripe 数据 Sync 失败 | Close 返回 EIO；另一 stripe 的位图即使恢复，未保存的 chunk 仍为 MISS；修复补块后可靠重启可读 |
+| chunk/bitmap/保存窗口强杀 | 数据写入前、部分数据写入、chunk 发布、部分位图写入、位图发布、数据 Sync 后检查点发布前均安全 MISS；可靠 Close 对照保留正确数据 |
+| checkpoint Rename 失败 | Close 返回错误，其他 stripe 仍完成关闭；临时文件清理，失败 stripe 重开不伪造命中 |
+| 格式与文件作用域 | 不兼容对象版本、块布局、segment 版本及旧 namespace 被拒绝；业务文件、无关 sidecar、独立缓存的原始字节保持不变 |
+| 真实进程重启 | 验证状态、响应头、正文 SHA 和源站正文计数；正常重启复用稀疏块，缺块单独回源；强杀或 PURGE 后重建不复活旧代次 |
+
+验证代码：[部分对象恢复](../cache/partial_recovery_test.go)、[进程 HTTP 恢复](../tools/partial_recovery_test.py)、[提交/回卷](../cache/storage_commit_test.go)、[恢复/损坏/子进程强杀](../cache/recovery_test.go)、[PURGE 后强杀](../cache/invalidation_restart_test.go)。数据及位图短写、EIO、ENOSPC 和数据 Sync、checkpoint Rename 失败已有确定性验证；未分别注入临时检查点文件 Sync、父目录 Sync 或物理断电，不将进程强杀等同于这些故障。

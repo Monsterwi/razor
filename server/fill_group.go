@@ -20,7 +20,7 @@ import (
 var errUnshareable = errors.New("origin response is not shareable")
 
 // fillGroup owns pre-origin tasks. OpenDir starts only after a real writer exists.
-// Bodies stay with a producer until committed, or go exclusively to its creator.
+// Admitted bodies stream through the cache writer; private bodies go only to the creator.
 type fillGroup struct {
 	mu                                                sync.Mutex
 	ctx                                               context.Context
@@ -28,17 +28,26 @@ type fillGroup struct {
 	tasks                                             map[string]*fillTask
 	producers                                         sync.WaitGroup
 	active, waiters                                   int
+	rangeSequence                                     uint64
 	joined, completed, unshareable, failed, cancelled uint64
 }
 
 type fillTask struct {
 	id                                     string
+	partialRoot                            string
 	token                                  *cache.FillToken
 	ctx                                    context.Context
 	cancel                                 context.CancelFunc
 	refs                                   int
+	fillingChunk                           bool  // Protected by fillGroup.mu.
+	fillingIndex                           int64 // Protected by fillGroup.mu.
 	done, creatorGone, privateDone, exited chan struct{}
 	private                                chan *http.Response
+	streamReady                            chan struct{}
+	partialReady                           chan struct{}
+	partial                                *partialGET
+	stream                                 *cache.CacheVC
+	rangeRun                               *rangeRun
 	result                                 fillResult
 }
 
@@ -81,34 +90,50 @@ func fillIdentity(r *http.Request, key []byte, version uint64) string {
 func (g *fillGroup) join(id string, token *cache.FillToken, cfg *config.Config) (*fillTask, bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	return g.joinLocked(id, token, cfg)
+}
+
+func (g *fillGroup) joinLocked(id string, token *cache.FillToken, cfg *config.Config) (*fillTask, bool, error) {
 	if err := g.ctx.Err(); err != nil {
 		return nil, false, err
 	}
 	if task := g.tasks[id]; task != nil {
 		if g.cache.CheckFill(task.token) == nil && task.ctx.Err() == nil {
-			if task.refs >= cfg.SharedFillMaxWaiters {
-				return nil, false, budget.ErrOverloaded
-			}
-			task.refs++
-			g.waiters++
-			g.joined++
-			return task, false, nil
+			return g.attachLocked(task, cfg)
 		}
 		delete(g.tasks, id)
-	}
-	if g.active >= cfg.SharedFillMaxTasks {
-		return nil, false, budget.ErrOverloaded
 	}
 	if err := g.cache.CheckFill(token); err != nil {
 		return nil, false, err
 	}
+	return g.newTaskLocked(id, token, cfg)
+}
+
+// Both public and private partial runs use the same bounded task lifetime.
+func (g *fillGroup) newTaskLocked(id string, token *cache.FillToken, cfg *config.Config) (*fillTask, bool, error) {
+	if err := g.ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if g.active >= cfg.SharedFillMaxTasks {
+		return nil, false, budget.ErrOverloaded
+	}
 	ctx, cancel := context.WithTimeout(g.ctx, time.Duration(cfg.SharedFillTimeout)*time.Second)
-	task := &fillTask{id: id, token: token, ctx: ctx, cancel: cancel, refs: 1, done: make(chan struct{}), creatorGone: make(chan struct{}), privateDone: make(chan struct{}), exited: make(chan struct{}), private: make(chan *http.Response)}
+	task := &fillTask{id: id, token: token, ctx: ctx, cancel: cancel, refs: 1, done: make(chan struct{}), creatorGone: make(chan struct{}), privateDone: make(chan struct{}), exited: make(chan struct{}), private: make(chan *http.Response), streamReady: make(chan struct{}), partialReady: make(chan struct{})}
 	g.tasks[id] = task
 	g.active++
 	g.waiters++
 	g.producers.Add(1)
 	return task, true, nil
+}
+
+func (g *fillGroup) attachLocked(task *fillTask, cfg *config.Config) (*fillTask, bool, error) {
+	if task.refs >= cfg.SharedFillMaxWaiters {
+		return nil, false, budget.ErrOverloaded
+	}
+	task.refs++
+	g.waiters++
+	g.joined++
+	return task, false, nil
 }
 func (g *fillGroup) leave(task *fillTask, creator bool) {
 	g.mu.Lock()
@@ -118,10 +143,30 @@ func (g *fillGroup) leave(task *fillTask, creator bool) {
 	}
 	task.refs--
 	g.waiters--
-	if task.refs == 0 {
+	if task.refs == 0 && !task.fillingChunk {
 		task.cancel()
 	}
 }
+
+func (g *fillGroup) beginPartialChunk(task *fillTask, index int64) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if task.refs == 0 {
+		task.cancel()
+	}
+	if err := task.ctx.Err(); err != nil {
+		return err
+	}
+	task.fillingChunk, task.fillingIndex = true, index
+	return nil
+}
+
+func (g *fillGroup) endPartialChunk(task *fillTask) {
+	g.mu.Lock()
+	task.fillingChunk = false
+	g.mu.Unlock()
+}
+
 func (g *fillGroup) finish(task *fillTask) {
 	task.cancel()
 	g.mu.Lock()
@@ -145,21 +190,38 @@ func (g *fillGroup) finish(task *fillTask) {
 }
 func (task *fillTask) publish(result fillResult) { task.result = result; close(task.done) }
 
+func (task *fillTask) publishStream(writer *cache.CacheVC) {
+	task.stream = writer
+	close(task.streamReady)
+}
+
 func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []byte, token *cache.FillToken) {
 	status := "MISS"
-	defer func() { s.cacheStatus(w, status) }()
+	defer func() {
+		if status != "" {
+			s.cacheStatus(w, status)
+		}
+	}()
 	resources := s.captureFillResources(r)
 	if resources.config.SharedFillPublicStatic == 1 {
 		r = resources.proxy.NormalizePublicRequest(r)
 	}
-	task, creator, err := s.fills.join(fillIdentity(r, key, resources.version), token, resources.config)
+	var task *fillTask
+	var creator bool
+	var err error
+	if blockGETEligible(r) {
+		task, creator, err = s.fills.joinPartial(fillIdentity(r, key, resources.version), partialDiscoveryKey(key, r), token, resources.config)
+	} else {
+		task, creator, err = s.fills.join(fillIdentity(r, key, resources.version), token, resources.config)
+	}
 	if err != nil {
 		resources.release()
 		s.counters.rejected.Add(1)
 		http.Error(w, "Cache fill unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	defer s.fills.leave(task, creator)
+	leave := sync.OnceFunc(func() { s.fills.leave(task, creator) })
+	defer leave()
 	if creator {
 		originRequest := withRequestRuntime(r, task.ctx, resources.runtime)
 		go func() {
@@ -170,12 +232,47 @@ func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []b
 	} else {
 		resources.release()
 	}
+	streaming := false
 	select {
 	case <-r.Context().Done():
 		return
+	case <-task.partialReady:
+	case <-task.streamReady:
+		streaming = true
+		// A fast producer may already have failed after publishing headers.
+		// Prefer its terminal result to treating that failure as a cache miss.
+		select {
+		case <-task.done:
+			streaming = false
+		default:
+		}
 	case <-task.done:
 	}
-	if creator && errors.Is(task.result.err, errUnshareable) {
+	select {
+	case <-task.partialReady:
+		select {
+		case <-task.done:
+			if task.result.err != nil {
+				s.upstreamError(w, r, task.result.err)
+				return
+			}
+		default:
+		}
+		p := task.partial
+		var handoff func()
+		if !p.full {
+			handoff = leave
+		}
+		status = "" // The partial response records its own final cache outcome.
+		s.servePartialObject(w, r, key, task.token, p.object, p.info, p.origin, true, false, task, handoff)
+		return
+	default:
+	}
+	if !streaming && errors.Is(task.result.err, errRangeBypass) {
+		s.proxyWithoutCache(w, r)
+		return
+	}
+	if !streaming && creator && errors.Is(task.result.err, errUnshareable) {
 		status = "BYPASS"
 		select {
 		case resp := <-task.private:
@@ -197,7 +294,7 @@ func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []b
 		}
 		return
 	}
-	if task.result.err != nil {
+	if !streaming && task.result.err != nil {
 		status := http.StatusBadGateway
 		if errors.Is(task.result.err, errUnshareable) || errors.Is(task.result.err, budget.ErrOverloaded) {
 			status = http.StatusServiceUnavailable
@@ -212,10 +309,20 @@ func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []b
 		return
 	}
 	if err := s.cache.CheckFill(task.token); err != nil {
+		if streaming {
+			// A stream can invalidate itself after discovering unsafe trailers.
+			http.Error(w, "Cache fill unavailable", http.StatusBadGateway)
+			return
+		}
 		http.Error(w, "Cache fill invalidated", http.StatusServiceUnavailable)
 		return
 	}
-	vc, err := s.cache.OpenReadCommitted(task.result.key)
+	var vc *cache.CacheVC
+	if streaming {
+		vc, err = task.stream.OpenReader(r.Context())
+	} else {
+		vc, err = s.cache.OpenReadCommitted(task.result.key)
+	}
 	if err != nil {
 		http.Error(w, "Completed object unavailable", http.StatusBadGateway)
 		return
@@ -228,12 +335,12 @@ func (s *Server) serveSharedMiss(w http.ResponseWriter, r *http.Request, key []b
 	}
 	fields, valid := varyFields(info.ResponseHeaders)
 	policy, safe := responsePolicy(info, s.now())
-	if !valid || !safe || string(representationKey(key, r.Header, fields)) != string(task.result.key) {
+	if !valid || !safe || string(representationKey(key, r.Header, fields)) != string(vc.Key) {
 		http.Error(w, "Completed object unavailable", http.StatusBadGateway)
 		return
 	}
 
-	if task.result.status != "" {
+	if !streaming && task.result.status != "" {
 		status = task.result.status
 	}
 	s.serveCacheHit(w, r, vc, info, policy)

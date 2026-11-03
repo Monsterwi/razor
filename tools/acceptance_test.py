@@ -1,7 +1,10 @@
 import os
+import json
+import time
 from contextlib import ExitStack
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -92,6 +95,23 @@ class PortReservationTest(unittest.TestCase):
 
 
 class PublicCLITest(unittest.TestCase):
+    def test_tools_reject_nonfixed_chunk_size_before_side_effects(self):
+        for script in ("acceptance.py", "hey_benchmark.py"):
+            for block in (65536, 4194304):
+                with self.subTest(script=script, block_bytes=block), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    command = [sys.executable, str(Path(__file__).with_name(script)),
+                               "--binary", str(root / "missing-razor"),
+                               "--output", str(root / "output"), "--cache-root", str(root / "cache"),
+                               "--block-bytes", str(block)]
+                    if script == "hey_benchmark.py":
+                        command += ["--hey", str(root / "missing-hey"), "--fixtures", str(root / "fixtures")]
+                    result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("--block-bytes: invalid choice", result.stderr)
+                    self.assertFalse((root / "output").exists())
+                    self.assertFalse((root / "cache").exists())
+
     def test_public_ats_combinations_rejected_before_side_effects(self):
         for mode in ("benchmark", "all"):
             for products in (("ats",), ("razor", "ats")):
@@ -113,7 +133,8 @@ class PublicCLITest(unittest.TestCase):
         for mode, public, products in (("benchmark", True, ["razor"]), ("all", True, ["razor"]), ("benchmark", False, ["ats"])):
             with self.subTest(mode=mode, public=public), tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
                 argv = ["acceptance.py", "--binary", "/missing/razor", "--output", str(Path(directory) / "output"),
-                        "--mode", mode, "--products", *products, "--ats-environment", "/missing/ats.json"]
+                        "--mode", mode, "--products", *products, "--ats-environment", "/missing/ats.json",
+                        "--block-bytes", "1048576"]
                 if public:
                     argv.append("--public-static")
                 cleanup.enter_context(patch.object(sys, "argv", argv))
@@ -166,11 +187,72 @@ class WorkloadTest(unittest.TestCase):
                                  paths=["/small-mixed", "/large-mixed"])
             self.assertEqual(mixed["object_requests"], {"small": 1, "large": 1})
             self.assertEqual(mixed["unexpected_errors"], 0)
+            self.assertEqual(mixed["response_body_bytes"], (256 << 10) + acceptance.CHUNK + 17)
+            self.assertEqual(mixed["origin_body_bytes_per_response_byte"], 1)
             unique = client.batch(product, origin, "unique", "/small-unique", 2, count=2, unique_paths=True)
             self.assertEqual(unique["origin"]["get"], 4)
             self.assertEqual(len({row["path"] for row in origin.records if "unique" in row["path"]}), 4)
             self.assertEqual(unique["unexpected_errors"], 0)
+            self.assertEqual(unique["response_body_bytes"], 1 << 20)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BatchStatsLogTest(unittest.TestCase):
+    def test_batch_preserves_record_boundaries_and_rejects_bad_json(self):
+        from public_acceptance import DRAIN_FIELDS
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            root = Path(directory)
+            fixtures = acceptance.create_fixtures(root / "fixtures", acceptance.MIB)
+            origin = acceptance.Origin(fixtures, root / "origin.json")
+            cleanup.callback(origin.close)
+            client = acceptance.Client(fixtures, root)
+            cleanup.callback(client.raw.close)
+            log = root / "process.log"
+            log.touch()
+            stats = dict.fromkeys((*DRAIN_FIELDS, "Requests", "Hits", "Misses", "Bypass", "Bytes",
+                "RangeBlockHits", "RangeBlockMisses", "RangeHitBytes", "RangeMissBytes", "SharedFillJoined",
+                "SharedFillCompleted", "SharedFillFailed", "Cancelled", "GCCount", "GCPauseTotalNanoseconds", "TotalAlloc"), 0)
+            stats["Origin"] = {"InFlight": 0}
+            def record(label):
+                return "HTTP resource stats JSON: " + json.dumps({**stats, "SnapshotUnixNano": time.time_ns(), "Sample": label}) + "\n"
+            pending, signals = [], 0
+            def emit(_):
+                nonlocal signals
+                signals += 1
+                with log.open("a") as stream:
+                    stream.write("".join(pending))
+                    pending.clear()
+                    stream.write(record("complete") + "Goroutines:1\n")
+                    if signals == 2:
+                        line = record("boundary")
+                        stream.write(line[:10])
+                        pending.append(line[10:])
+            product = SimpleNamespace(kind="razor", port=origin.server.server_port, dir=root,
+                proc=SimpleNamespace(send_signal=emit), resource=lambda: {
+                    "cpu_seconds": 0, "rss_bytes": 0, "fds": 0, "read_bytes": 0, "write_bytes": 0})
+            sample_origin, origin_samples = origin.snapshot, 0
+            def sample_and_write_tail():
+                nonlocal origin_samples
+                result = sample_origin()
+                origin_samples += 1
+                if origin_samples == 2:
+                    line = record("tail")
+                    with log.open("a") as stream:
+                        stream.write(line[:-5])
+                    pending.append(line[-5:])
+                elif origin_samples == 4:
+                    with log.open("a") as stream:
+                        stream.write('HTTP resource stats JSON: {broken}\n')
+                return result
+            with patch.object(origin, "snapshot", side_effect=sample_and_write_tail):
+                result = client.batch(product, origin, "partial-stats", "/small-log", 1, count=1)
+                with self.assertRaises(json.JSONDecodeError):
+                    client.batch(product, origin, "malformed-stats", "/small-log", 1, count=1)
+            self.assertEqual(result["requests"], 1)
+            self.assertEqual(result["unexpected_errors"], 0)
+            labels = [sample["Sample"] for sample in result["server_stats_samples"]]
+            self.assertIn("boundary", labels, "batch start discarded a partial marker")
+            self.assertNotIn("tail", labels, "batch included an unfinished record")

@@ -44,7 +44,8 @@ def main():
     parser.add_argument("--public-static", action="store_true")
     parser.add_argument("--ram-algorithm", choices=("otter", "s3-fifo"), default="otter")
     parser.add_argument("--ram-bytes", type=int, default=10 * MIB)
-    parser.add_argument("--block-bytes", type=int, default=MIB)
+    parser.add_argument("--block-bytes", type=int, choices=(MIB,), default=MIB,
+                        help="compatibility option; chunk size is fixed at 1 MiB")
     parser.add_argument("--seconds", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
@@ -77,6 +78,7 @@ def main():
             path = f"/{size}-hey-hot"
             expected_bytes, _ = client.expected(path)
             client.checked(product, path)
+            drain(product)
             for concurrency in steps:
                 for repeat in range(args.repeats):
                     name = f"{size}-c{concurrency}-r{repeat + 1}"
@@ -117,6 +119,7 @@ def main():
                     print(name, result["requests"], round(result["mib_per_second"], 2), "MiB/s", flush=True)
         path = "/large-physical-read"
         client.checked(product, path)
+        drain(product)
         for repeat in range(args.repeats):
             product.stop()
             product.start()

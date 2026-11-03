@@ -35,6 +35,7 @@ func NewCacheVCRead(stripe *Stripe, key []byte) (*CacheVC, error) {
 		return nil, ErrCacheClosed
 	}
 	vc.generation = stripe.OpenDir.Generation()
+	purgeEpoch := stripe.OpenDir.purgeEpoch.Load()
 	vc.entry = stripe.OpenDir.Acquire(key)
 	stripe.mu.Unlock()
 	if vc.entry != nil {
@@ -43,6 +44,7 @@ func NewCacheVCRead(stripe *Stripe, key []byte) (*CacheVC, error) {
 		vc.reader = NewCacheReader(stripe, key)
 	}
 	vc.reader.ctx = ctx
+	vc.reader.purgeEpoch = purgeEpoch
 	return vc, nil
 }
 
@@ -75,14 +77,23 @@ func newCacheVCWriteLocked(ctx context.Context, token *FillToken) (*CacheVC, err
 	w.cancel()
 	w.ctx, w.cancel = context.WithCancel(ctx)
 	w.generation, w.selector, w.policy = token.generation, token.selector, token.policy
+	w.purgeEpoch = token.purgeEpoch
 	w.fenceSelector, w.fencePolicy = token.fenceSelector, token.fencePolicy
-	if stripe.closing || stripe.storageErr != nil {
+	if stripe.storageErr != nil {
+		w.cancel()
+		return nil, stripe.storageErr
+	}
+	if stripe.closing {
 		w.cancel()
 		return nil, ErrCacheClosed
 	}
 	if token.generation != stripe.OpenDir.Generation() || token.policy != stripe.OpenDir.policyEpoch(token.selector).Load() || (len(token.fenceSelector) > 0 && token.fencePolicy != stripe.OpenDir.policyEpoch(token.fenceSelector).Load()) {
 		w.cancel()
 		return nil, ErrInvalidated
+	}
+	if err := stripe.OpenDir.checkPurge(token.purgeEpoch, token.selector); err != nil {
+		w.cancel()
+		return nil, err
 	}
 	if stripe.OpenDir.Get(key) != nil {
 		w.cancel()
@@ -101,6 +112,56 @@ func newCacheVCWriteLocked(ctx context.Context, token *FillToken) (*CacheVC, err
 }
 
 func (vc *CacheVC) IsRWW() bool { return vc.reading && vc.reader != nil && vc.reader.writer != nil }
+
+// OpenReader subscribes to this exact writer, including after it has finished.
+// A replacement writer for the same key can never supply this reader's bytes.
+// The caller owns the returned reader and must close it.
+func (vc *CacheVC) OpenReader(ctx context.Context) (*CacheVC, error) {
+	if !vc.writing || vc.writer == nil {
+		return nil, fmt.Errorf("no writer to subscribe to")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	vc.Stripe.mu.Lock()
+	if vc.Stripe.closing {
+		vc.Stripe.mu.Unlock()
+		return nil, ErrCacheClosed
+	}
+	if vc.generation != vc.Stripe.OpenDir.Generation() {
+		vc.Stripe.mu.Unlock()
+		return nil, ErrInvalidated
+	}
+	vc.entry.mutex.Lock()
+	vc.entry.RefCount++
+	vc.entry.mutex.Unlock()
+	vc.Stripe.mu.Unlock()
+	readCtx, cancel := context.WithCancel(ctx)
+	reader := NewCacheReaderFromWriter(vc.Stripe, vc.Key, vc.writer)
+	reader.ctx = readCtx
+	return &CacheVC{Stripe: vc.Stripe, Key: append([]byte(nil), vc.Key...), reading: true,
+		reader: reader, entry: vc.entry, generation: vc.generation, done: readCtx.Done(), readCancel: cancel}, nil
+}
+
+// CommittedRevision identifies this writer's committed record, even after its
+// key is replaced. It never adopts the current directory entry's revision.
+func (vc *CacheVC) CommittedRevision() (uint64, error) {
+	if !vc.writing || vc.writer == nil {
+		return 0, fmt.Errorf("no writer revision")
+	}
+	vc.writer.mutex.RLock()
+	defer vc.writer.mutex.RUnlock()
+	if vc.writer.err != nil {
+		return 0, vc.writer.err
+	}
+	if !vc.writer.closed {
+		return 0, fmt.Errorf("writer has not committed")
+	}
+	if vc.writer.purged.Load() {
+		return 0, ErrPurged
+	}
+	return vc.writer.version, nil
+}
 
 func (vc *CacheVC) WaitForHeaders(timeout time.Duration) error {
 	if !vc.IsRWW() {
@@ -161,8 +222,9 @@ func (vc *CacheVC) Close() error {
 		if vc.writing {
 			vc.closeErr = vc.writer.Close()
 			vc.writer.cancel()
+		} else {
+			vc.Stripe.OpenDir.Release(vc.Key, vc.entry)
 		}
-		vc.Stripe.OpenDir.Release(vc.Key, vc.entry)
 	})
 	return vc.closeErr
 }
@@ -180,8 +242,9 @@ func (vc *CacheVC) Abort(err error) {
 		if vc.writing {
 			vc.writer.Abort(err)
 			vc.closeErr = vc.writer.Close()
+		} else {
+			vc.Stripe.OpenDir.Release(vc.Key, vc.entry)
 		}
-		vc.Stripe.OpenDir.Release(vc.Key, vc.entry)
 	})
 }
 

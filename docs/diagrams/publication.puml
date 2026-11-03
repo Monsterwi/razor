@@ -8,20 +8,29 @@ skinparam ArrowColor #334155
 skinparam componentBackgroundColor #EFF6FF
 skinparam stateBackgroundColor #EFF6FF
 hide empty description
-state "接收中\n读者不可见" as Receiving
+state "接收中\n校验头部后可 RWW" as Receiving
 state "提交中\n头片段最后写" as Committing
-state "可读取\n校验后的完整对象" as Readable
+state "已提交\n完整记录可验证读取" as Readable
 state "失败 / 失效\n不可新命中" as Invalid
+state "仅旧响应可读\n禁止目录与位图发布" as Private
 [*] --> Receiving : 取得写入所有权及 FillToken
 Receiving --> Committing : 正文完整且校验通过
-Receiving --> Invalid : 错误 / 取消 / 超时
+Receiving --> Receiving : 最后读者离开，当前块独立收尾
+Receiving --> Invalid : 错误 / 任务取消 / 超时
 Committing --> Readable : 写入完成且版本 / 所有权 / token 有效
-Committing --> Invalid : 写失败或围栏失效
-Readable --> Invalid : PURGE / 替换 / 环形覆盖
+Committing --> Invalid : 写失败或强制失效
+Receiving --> Private : PURGE 撤销发布权
+Committing --> Private : PURGE 撤销发布权
+Readable --> Private : PURGE，仍持有正确旧字节
+Readable --> Invalid : 替换 / 环形覆盖 / 损坏
+Private --> Invalid : 上游 / 存储错误或任务取消
+Private --> [*] : 当前私有块结束且无读者
 Invalid --> [*]
 note right of Readable
-  manifest、每个逻辑块均是独立完整对象
+  chunk 数据及目录先发布，再置 segment 完成位
+  位图仅供规划，实际读取仍须校验
   可读提交不等于逐块 fsync
-  已发送字节不能撤回
+  客户端可在提交前结束响应
+  已完成响应不能追溯失败
 end note
 @enduml

@@ -32,7 +32,7 @@ func (c *Cache) fillSnapshotLocked(selector []byte) ([]fillHead, error) {
 }
 
 func (c *Cache) rangeSnapshotLocked(selector []byte) ([]fillHead, error) {
-	prefix := append(append([]byte(nil), selector...), []byte("\nrange:manifest:")...)
+	prefix := append(append([]byte(nil), selector...), []byte(PartialObjectPrefix)...)
 	var heads []fillHead
 	for _, s := range c.Stripes {
 		keys, err := s.DirMgr.DirTrie.KeysForPrefixLimit(prefix, MaxFillVariants-len(heads))
@@ -59,23 +59,33 @@ func (c *Cache) lockStripes() func() {
 }
 
 func (c *Cache) checkFillEpochsLocked(token *FillToken) error {
-	if token == nil || len(token.stripes) != len(c.Stripes) || len(token.generations) != len(c.Stripes) || len(token.wraps) != len(c.Stripes) || len(token.policies) != len(c.Stripes) {
+	if token == nil || len(token.stripes) != len(c.Stripes) || len(token.generations) != len(c.Stripes) || len(token.purges) != len(c.Stripes) || len(token.wraps) != len(c.Stripes) || len(token.policies) != len(c.Stripes) {
 		return ErrInvalidated
 	}
+	var purged error
 	if token.parent != nil {
 		if err := c.checkFillEpochsLocked(token.parent); err != nil {
-			return err
+			if !errors.Is(err, ErrPurged) {
+				return err
+			}
+			purged = err
 		}
 	}
 	for i, s := range c.Stripes {
+		if s.storageErr != nil {
+			return s.storageErr
+		}
 		if s.closing {
 			return ErrCacheClosed
 		}
 		if token.stripes[i] != s || token.generations[i] != s.OpenDir.Generation() || token.policies[i] != s.OpenDir.policyEpoch(token.selector).Load() {
 			return ErrInvalidated
 		}
+		if err := s.OpenDir.checkPurge(token.purges[i], token.selector); err != nil {
+			purged = err
+		}
 	}
-	return nil
+	return purged
 }
 
 func (c *Cache) checkFillLocked(token *FillToken) error {
@@ -160,6 +170,7 @@ func (c *Cache) openWriteFillKeyReplacingLocked(ctx context.Context, token *Fill
 	for i, s := range c.Stripes {
 		if s == bound.stripe {
 			bound.generation = token.generations[i]
+			bound.purgeEpoch = token.purges[i]
 			bound.policy = token.policies[i]
 			if token.parent != nil {
 				bound.fenceSelector = token.parent.selector
@@ -183,8 +194,16 @@ func (c *Cache) openWriteFillKeyReplacingLocked(ctx context.Context, token *Fill
 // InvalidateFill fences unfinished fills and removes only snapshot-owned heads.
 // A writer reservation must not prevent fencing, but newer committed heads survive.
 func (c *Cache) InvalidateFill(token *FillToken) error {
+	return c.invalidateFill(token, false)
+}
+
+func (c *Cache) invalidateFill(token *FillToken, unchanged bool) error {
 	unlock := c.lockStripes()
-	if err := c.checkFillEpochsLocked(token); err != nil {
+	check := c.checkFillEpochsLocked
+	if unchanged {
+		check = c.checkFillLocked
+	}
+	if err := check(token); err != nil {
 		unlock()
 		return err
 	}

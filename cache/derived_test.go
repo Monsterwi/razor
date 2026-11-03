@@ -228,7 +228,7 @@ func TestUnsafePolicyRemovesOnlyCapturedRangeManifest(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	const key = "/item\nrange:manifest:v2:1048576:origin"
+	const key = "/item\nrange:object:v3:origin"
 	write(key, "old")
 	old, _ := c.BeginFill([]byte("/item"), []byte("/item"))
 	if err := c.InvalidateFill(old); err != nil {

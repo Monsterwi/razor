@@ -13,32 +13,37 @@ actor "客户端 B" as B
 participant "Razor 请求处理器" as R
 participant "fillGroup / 块生产者" as F
 participant "固定源站" as O
-database "块缓存" as K
-note over R,K : fresh manifest 已存在，块大小 1 MiB
+database "块缓存与 segment 位图" as K
+note over R,K : fresh 对象元数据已存在；固定 1 MiB/chunk、64 chunk/segment
 A -> R : Range [0, 2 MiB)
-R -> F : 块 0 MISS，创建任务
-F -> O : Range 块 0 + If-Match
+R -> F : 原子认领缺块区间 [0, 2)
+F -> O : 一次对齐 Range [0, 2 MiB) + If-Match
 B -> R : Range [0.5 MiB, 1.5 MiB)
-R -> F : 加入块 0 任务
-O --> F : 完整块 0
-F -> K : 校验并提交块 0
-F --> R : 唤醒订阅者
-R -> K : 各自读取已提交块 0
-par 发送当前块所需部分
-  R --> A : 206 / 块 0 全部
-  R --> B : 206 / 块 0 后半部分
-else 每请求最多准备下一块
-  R -> F : 确保块 1，共享在途任务
-  F -> O : Range 块 1 + If-Match
-  O --> F : 完整块 1
-  F -> K : 校验并提交块 1
-  F --> R : 块 1 完成
-end
-R -> K : 各自在需要时读取块 1
-R --> A : 块 1 全部，完成
-R --> B : 块 1 前半部分，完成
+R -> F : 加入重叠在途区间
+O --> F : 合法响应头与块 0 前缀
+F --> R : 独立 reader 读取确切 writer
+R --> A : 206 / 已到达的块 0 前缀
+R --> B : 206 / 从 0.5 MiB 起的已到达字节
+note over A,K : 块 0 尚未收齐；块内前缀已可发送，完成位仍为 0
+O --> F : 块 0 剩余正文
+F --> R : 已到达字节继续流式读取
+R --> A : 块 0 的其余所需字节
+R --> B : 块 0 的其余所需字节
+F -> K : 完整校验、数据与目录提交、置块 0 完成位
+F --> R : 块 0 完成通知
+O --> F : 同一源响应继续到达块 1 前缀
+F --> R : 逐块 writer / 独立偏移
+R --> A : 块 1 已到达的所需前缀
+R --> B : 块 1 前半部分，响应完成
+A -> R : 断开连接
+R -> F : 释放最后一个订阅
+note over F,K : 块 1 已开始，独立完成当前块；不开始后续块
+O --> F : 块 1 剩余正文与结束
+F -> K : 完整校验、数据与目录提交、置块 1 完成位
+F -> F : 无订阅需求，释放源响应与任务
 note over A,K
-块 0 提交即可发送，不等整对象
-预取额度不足时退回按需获取
+正常发布路径；每个 run 最多两个 chunk，不跨 segment
+所需字节到齐即可完成响应；块提交独立完成
+当前块仍受任务期限、关闭和存储错误约束
 end note
 @enduml

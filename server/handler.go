@@ -40,6 +40,9 @@ func (s *Server) handleGet(key []byte, w http.ResponseWriter, r *http.Request) {
 		s.proxyWithoutCache(w, r)
 		return
 	}
+	if blockGETEligible(r) && s.serveKnownPartialGET(w, r, key) {
+		return
+	}
 	selected, selectedInfo, policy, lookupErr := s.lookupCached(key, r)
 	if lookupErr != nil {
 		s.proxyWithoutCache(w, r)
@@ -56,9 +59,6 @@ func (s *Server) handleGet(key []byte, w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodHead {
 		s.proxyWithoutCache(w, r)
-		return
-	}
-	if requestRuntime(r).config.SharedFillPublicStatic == 1 && blockGETEligible(r) && s.serveBlocks(w, r, key, true) {
 		return
 	}
 	// Capture the invalidation fence before origin work, never on a fresh HIT.
@@ -137,6 +137,14 @@ func (s *Server) serveCacheHit(w http.ResponseWriter, r *http.Request, vc *cache
 	w.WriteHeader(info.Status)
 	if r.Method == http.MethodHead {
 		return
+	}
+	if vc.IsRWW() {
+		// Headers have passed shared-cache admission. Make the start of the
+		// response observable even if the producer fails before the first byte;
+		// an unflushed abort on a reused connection can trigger client retries.
+		if err := http.NewResponseController(w).Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			panic(http.ErrAbortHandler)
+		}
 	}
 	if err := s.streamResponse(w, vc, r); err != nil {
 		logger.Errorf("Cache response transfer failed: %v", err)

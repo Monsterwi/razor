@@ -2,7 +2,6 @@ package server_test
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -160,26 +159,24 @@ func TestTruncatedOriginDoesNotCommit(t *testing.T) {
 	front := httptest.NewServer(s)
 	defer front.Close()
 	for range 2 {
-		resp, err := http.Get(front.URL + "/item")
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil || resp.StatusCode != http.StatusBadGateway {
-			t.Fatalf("incomplete origin response: status=%d err=%v", resp.StatusCode, err)
-		}
+		assertFailedSharedHTTP(t, front.Client(), front.URL+"/item")
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("truncated response cached: %d origin calls", calls.Load())
 	}
 }
 
-type disconnectedClient struct{ header http.Header }
+type disconnectedClient struct {
+	header      http.Header
+	beforeError func()
+}
 
-func (w *disconnectedClient) Header() http.Header       { return w.header }
-func (w *disconnectedClient) WriteHeader(int)           {}
-func (w *disconnectedClient) Write([]byte) (int, error) { return 0, fmt.Errorf("client disconnected") }
+func (w *disconnectedClient) Header() http.Header { return w.header }
+func (w *disconnectedClient) WriteHeader(int)     {}
+func (w *disconnectedClient) Write([]byte) (int, error) {
+	w.beforeError()
+	return 0, fmt.Errorf("client disconnected")
+}
 
 func TestClientFailureDoesNotDiscardCompletedObject(t *testing.T) {
 	s, calls := cacheServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -192,7 +189,13 @@ func TestClientFailureDoesNotDiscardCompletedObject(t *testing.T) {
 				t.Errorf("transfer abort = %v", got)
 			}
 		}()
-		s.ServeHTTP(&disconnectedClient{make(http.Header)}, httptest.NewRequest("GET", "http://cache.test/item", nil))
+		s.ServeHTTP(&disconnectedClient{
+			header: make(http.Header),
+			beforeError: func() {
+				// RWW can reach the client before publication; fail only after completion.
+				waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillCompleted == 1 })
+			},
+		}, httptest.NewRequest("GET", "http://cache.test/item", nil))
 	}()
 	got := fetch(s, "http://cache.test/item", nil)
 	if calls.Load() != 1 || got.Body.String() != "complete origin" {
@@ -346,15 +349,7 @@ func TestTruncatedChunkedOriginAbortsDownstream(t *testing.T) {
 	front := httptest.NewServer(s)
 	defer front.Close()
 	for range 2 {
-		resp, err := http.Get(front.URL + "/item")
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil || resp.StatusCode != http.StatusBadGateway {
-			t.Fatalf("truncated chunked origin status=%d err=%v", resp.StatusCode, err)
-		}
+		assertFailedSharedHTTP(t, front.Client(), front.URL+"/item")
 	}
 	if calls.Load() != 2 {
 		t.Fatal("truncated response was cached")
@@ -372,10 +367,13 @@ func TestLateTrailersPreventCaching(t *testing.T) {
 		fmt.Fprint(rw, "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=3600\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nSet-Cookie: user=alice\r\n\r\n")
 		rw.Flush()
 	})
-	fetch(s, "http://cache.test/item", nil)
-	fetch(s, "http://cache.test/item", nil)
+	front := httptest.NewServer(s)
+	defer front.Close()
+	for range 2 {
+		assertFailedSharedHTTP(t, front.Client(), front.URL+"/item")
+	}
 	if calls.Load() != 2 {
-		t.Fatal("unannounced late response trailers were cached")
+		t.Fatalf("two requests for rejected trailers made %d origin calls (%d cache requests)", calls.Load(), s.Stats().Requests)
 	}
 }
 

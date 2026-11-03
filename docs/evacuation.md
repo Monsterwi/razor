@@ -12,7 +12,7 @@
 | 搬迁前 | 校验目录指向、Doc 身份/CRC、有界长度，记录 generation/PURGE 代次 |
 | 后台执行 | 正常写入后进入有界 evacuation 队列；队列满可放弃，允许淘汰 MISS |
 | 发布 | 新位置写入完成后，再核对原目录所有权与代次，才切换映射；已替换/失效记录不复活 |
-| 与 HTTP RWW | 不等价；HTTP 只读取完整提交块，见 [RWW](rww_implementation.md) |
+| 与 HTTP RWW | 不等价；HTTP 在校验响应头后可读取确切 writer 的在途字节，完整提交后才允许普通命中，见 [RWW](rww_implementation.md) |
 
 代码：[EvacuationTable](../cache/evacuation.go)、[Stripe](../cache/stripe.go)、[注册入口](../cache/cache_read.go)。测试：[迁移和重复注册](../cache/evacuation_test.go)、[覆盖与发布](../cache/storage_commit_test.go)。
 

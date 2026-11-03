@@ -44,6 +44,8 @@ type OpenDir struct {
 	mutex        sync.RWMutex
 	entries      map[string]*OpenDirEntry
 	generation   atomic.Uint64
+	purgeEpoch   atomic.Uint64
+	purges       [purgeHistorySize]purgeEvent
 	policyEpochs [1024]atomic.Uint64
 }
 
@@ -119,6 +121,16 @@ func (od *OpenDir) Acquire(key []byte) *OpenDirEntry {
 
 // Release cannot drop a replacement entry after an invalidation.
 func (od *OpenDir) Release(key []byte, expected *OpenDirEntry) {
+	od.release(key, expected, false)
+}
+
+// A terminal writer no longer owns the key. Existing readers retain their
+// exact entry and writer independently of the active-writer directory.
+func (od *OpenDir) releaseWriter(key []byte, expected *OpenDirEntry) {
+	od.release(key, expected, true)
+}
+
+func (od *OpenDir) release(key []byte, expected *OpenDirEntry, writerDone bool) {
 	if expected == nil {
 		return
 	}
@@ -128,7 +140,7 @@ func (od *OpenDir) Release(key []byte, expected *OpenDirEntry) {
 	expected.RefCount--
 	remove := expected.RefCount <= 0
 	expected.mutex.Unlock()
-	if remove && od.entries[string(key)] == expected {
+	if (writerDone || remove) && od.entries[string(key)] == expected {
 		delete(od.entries, string(key))
 	}
 }
@@ -151,6 +163,17 @@ func (od *OpenDir) detach(key []byte) *OpenDirEntry {
 		if entry.Writer.cancel != nil {
 			entry.Writer.cancel()
 		}
+	}
+	return entry
+}
+
+func (od *OpenDir) retirePartial(key []byte) *OpenDirEntry {
+	od.mutex.Lock()
+	defer od.mutex.Unlock()
+	entry := od.entries[string(key)]
+	delete(od.entries, string(key))
+	if entry != nil && entry.Writer.chunkLength > 0 {
+		entry.Writer.purged.Store(true)
 	}
 	return entry
 }

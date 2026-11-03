@@ -3,15 +3,161 @@ from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 import http.client
+import json
 import os
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from acceptance import Client, Origin, create_fixtures, MIB
 
 
+class StatsSnapshotTest(unittest.TestCase):
+    def test_snapshot_waits_for_split_marker_and_json_without_losing_bytes(self):
+        from public_acceptance import snapshot
+        line = '日志 HTTP resource stats JSON: {"SnapshotUnixNano":200,"InFlight":0}\n'.encode()
+        for split in (len('日志 HTTP res'.encode()), len(line) - 5):
+            with self.subTest(split=split), tempfile.TemporaryDirectory() as directory:
+                log = Path(directory) / "process.log"
+                product = SimpleNamespace(dir=Path(directory), resource=lambda: {},
+                    proc=SimpleNamespace(send_signal=lambda _: log.write_bytes(line[:split])))
+                def wait(check, description):
+                    self.assertFalse(check(), "an unfinished log record became a snapshot")
+                    with log.open("ab") as stream:
+                        stream.write(line[split:])
+                    self.assertTrue(check(), "the split record was discarded")
+                with patch("public_acceptance.wait_for", wait), patch("public_acceptance.time.time_ns", return_value=100):
+                    result = snapshot(product)
+                self.assertEqual(result["stats"], {"SnapshotUnixNano": 200, "InFlight": 0})
+                self.assertEqual(product.stats_offset, len(line))
+
+    def test_snapshot_leaves_trailing_partial_marker_for_next_call(self):
+        from public_acceptance import snapshot
+        first = b'HTTP resource stats JSON: {"SnapshotUnixNano":200,"InFlight":1}\n'
+        second = b'HTTP resource stats JSON: {"SnapshotUnixNano":300,"InFlight":0}\n'
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "process.log"
+            log.touch()
+            pieces = iter((first + second[:10], second[10:]))
+            def emit(_):
+                with log.open("ab") as stream:
+                    stream.write(next(pieces))
+            product = SimpleNamespace(dir=Path(directory), resource=lambda: {}, proc=SimpleNamespace(send_signal=emit))
+            with patch("public_acceptance.time.time_ns", side_effect=(100, 250)):
+                self.assertEqual(snapshot(product)["stats"]["InFlight"], 1)
+                self.assertEqual(product.stats_offset, len(first))
+                self.assertEqual(snapshot(product)["stats"]["InFlight"], 0)
+                self.assertEqual(product.stats_offset, len(first + second))
+
+    def test_snapshot_rejects_complete_malformed_json(self):
+        from public_acceptance import snapshot
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "process.log"
+            product = SimpleNamespace(dir=Path(directory), resource=lambda: {}, proc=SimpleNamespace(
+                send_signal=lambda _: log.write_text('HTTP resource stats JSON: {broken}\n')))
+            with self.assertRaises(json.JSONDecodeError):
+                snapshot(product)
+
+
 class PublicToolsTest(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("RAZOR_ACCEPTANCE_BINARY"), "set RAZOR_ACCEPTANCE_BINARY for real binary smoke")
+    def test_real_binary_purge_keeps_started_stream_and_fences_late_publication(self):
+        from acceptance import Product
+        from public_acceptance import purge_active_response
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            root = Path(directory)
+            fixtures = create_fixtures(root / "fixtures", 3 * MIB + 37)
+            origin = Origin(fixtures, root / "origin.json")
+            cleanup.callback(origin.close)
+            client = Client(fixtures, root)
+            cleanup.callback(client.raw.close)
+            args = SimpleNamespace(binary=Path(os.environ["RAZOR_ACCEPTANCE_BINARY"]), cache_root=None,
+                public_static=True, ram_algorithm="otter", ram_bytes=10 * MIB, block_bytes=MIB)
+            product = Product("razor", root / "purge", origin, args, capacity=64)
+            cleanup.callback(product.stop)
+            for prefix in (False, True):
+                for full in (False, True):
+                    with self.subTest(prefix=prefix, full=full):
+                        purge_active_response(product, origin, client, full=full, prefix=prefix)
+            with self.subTest(old_version="unavailable"):
+                purge_active_response(product, origin, client, retain_old=False)
+
+    def test_origin_retains_old_version_only_for_matching_if_match(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            root = Path(directory)
+            fixtures = create_fixtures(root / "fixtures", 3 * MIB)
+            origin = Origin(fixtures, root / "origin.json")
+            cleanup.callback(origin.close)
+            client = Client(fixtures, root)
+            cleanup.callback(client.raw.close)
+            product = SimpleNamespace(kind="origin", port=origin.server.server_port)
+            path = "/large-retained"
+            origin.rules[path] = {"version": 2, "retain_old_version": True}
+            client.checked(product, path, expected=client.expected(path, version=2))
+            client.checked(product, path, headers={"Range": "bytes=17-23", "If-Match": '"large-v1"'},
+                           status=206, expected=client.expected(path, bounds=(17, 23)))
+            client.checked(product, path, headers={"Range": "bytes=17-23", "If-Match": '"unknown"'}, status=412, expected=None)
+
+    def test_origin_records_get_progress_before_old_chunk_repair(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            root = Path(directory)
+            fixtures = create_fixtures(root / "fixtures", 2 * MIB)
+            origin = Origin(fixtures, root / "origin.json")
+            cleanup.callback(origin.close)
+            client = Client(fixtures, root)
+            cleanup.callback(client.raw.close)
+            entered, gate = threading.Event(), threading.Event()
+            cleanup.callback(gate.set)
+            path = "/large-progress"
+            origin.rules[path] = {"body_gate_at": MIB, "entered": entered, "gate": gate}
+            connection = http.client.HTTPConnection("127.0.0.1", origin.server.server_port, timeout=3)
+            cleanup.callback(connection.close)
+            connection.request("GET", path)
+            response = connection.getresponse()
+            self.assertEqual(len(response.read(MIB)), MIB)
+            self.assertTrue(entered.wait(1))
+            origin.rules[path] = {"version": 2, "retain_old_version": True}
+            product = SimpleNamespace(kind="origin", port=origin.server.server_port)
+            client.checked(product, path, headers={"Range": "bytes=0-16", "If-Match": '"large-v1"'},
+                           status=206, expected=client.expected(path, bounds=(0, 16)))
+            self.assertEqual(origin.records[-1]["ordinary_get_bytes_at_start"], {'"large-v1"': MIB})
+
+    def test_body_gate_uses_absolute_offset_inside_one_range_response(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            root = Path(directory)
+            fixtures = create_fixtures(root / "fixtures", 3 * MIB)
+            origin = Origin(fixtures, root / "origin.json")
+            cleanup.callback(origin.close)
+            entered, gate = threading.Event(), threading.Event()
+            cleanup.callback(gate.set)
+            path, offset = "/large-body-gate", MIB + 17
+            origin.rules[path] = {"body_gate_at": offset, "entered": entered, "gate": gate}
+            client = Client(fixtures, root)
+            cleanup.callback(client.raw.close)
+            product = SimpleNamespace(kind="origin", port=origin.server.server_port)
+            client.checked(product, path, method="HEAD", expected=None)
+            for bounds in ((0, 16), (2 * MIB, 2 * MIB + 16)):
+                client.checked(product, path, headers={"Range": f"bytes={bounds[0]}-{bounds[1]}"},
+                               status=206, expected=client.expected(path, bounds=bounds))
+            self.assertFalse(entered.is_set(), "HEAD or a different range reached the body gate")
+            before = origin.snapshot(path)
+            connection = http.client.HTTPConnection("127.0.0.1", product.port, timeout=3)
+            cleanup.callback(connection.close)
+            start, end = MIB // 2, 2 * MIB - 1
+            connection.request("GET", path, headers={"Range": f"bytes={start}-{end}"})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 206)
+            self.assertEqual(response.getheader("Content-Range"), f"bytes {start}-{end}/{3 * MIB}")
+            self.assertEqual(int(response.getheader("Content-Length")), end - start + 1)
+            prefix = response.read(offset - start)
+            self.assertTrue(entered.wait(1))
+            self.assertFalse(gate.is_set())
+            self.assertEqual(origin.snapshot(path)["bytes"] - before["bytes"], offset - start)
+            self.assertEqual(prefix, fixtures[("large", 1)].read_bytes()[start:offset])
+            gate.set()
+            self.assertEqual(prefix + response.read(), fixtures[("large", 1)].read_bytes()[start:end + 1])
+
     def test_block_fault_is_scoped_and_source_address_is_real(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             root = Path(directory)
@@ -28,6 +174,33 @@ class PublicToolsTest(unittest.TestCase):
                 self.assertFalse(row["error"], row)
             self.assertEqual({r["remote_ip"] for r in origin.records}, {"127.0.0.42"})
             self.assertEqual([r["status"] for r in origin.records], [206, 200])
+
+    def test_body_truncation_preserves_exact_prefix_at_absolute_offset(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            root = Path(directory)
+            fixtures = create_fixtures(root / "fixtures", 3 * MIB)
+            origin = Origin(fixtures, root / "origin.json")
+            cleanup.callback(origin.close)
+            path, offset = "/large-body-truncate", MIB + 31
+            origin.rules[path] = {"truncate_at": offset}
+            data = fixtures[("large", 1)].read_bytes()
+            for start, end in ((0, 16), (MIB // 2, 2 * MIB - 1), (2 * MIB, 2 * MIB + 16)):
+                with self.subTest(start=start, end=end):
+                    connection = http.client.HTTPConnection("127.0.0.1", origin.server.server_port, timeout=3)
+                    try:
+                        connection.request("GET", path, headers={"Range": f"bytes={start}-{end}"})
+                        response = connection.getresponse()
+                        self.assertEqual(response.status, 206)
+                        self.assertEqual(response.getheader("Content-Range"), f"bytes {start}-{end}/{3 * MIB}")
+                        self.assertEqual(int(response.getheader("Content-Length")), end - start + 1)
+                        if start <= offset <= end:
+                            with self.assertRaises(http.client.IncompleteRead) as caught:
+                                response.read()
+                            self.assertEqual(caught.exception.partial, data[start:offset])
+                        else:
+                            self.assertEqual(response.read(), data[start:end + 1])
+                    finally:
+                        connection.close()
 
     def test_truncated_origin_block_is_short_on_real_http_at_every_layout(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
@@ -97,10 +270,9 @@ class PublicToolsTest(unittest.TestCase):
     def test_real_binary_public_contracts_both_policies(self):
         from public_acceptance import public_functional
         for algorithm in ("otter", "s3-fifo"):
-            for block in (64 << 10, MIB, 4 * MIB):
-                with self.subTest(algorithm=algorithm, block_bytes=block), tempfile.TemporaryDirectory() as directory:
-                    root = Path(directory)
-                    fixtures = create_fixtures(root / "fixtures", max(4 * MIB, 3 * block))
-                    args = SimpleNamespace(binary=Path(os.environ["RAZOR_ACCEPTANCE_BINARY"]), cache_root=None,
-                        public_static=True, ram_algorithm=algorithm, ram_bytes=10 * MIB, block_bytes=block)
-                    public_functional(args, fixtures, root, smoke=True)
+            with self.subTest(algorithm=algorithm), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                fixtures = create_fixtures(root / "fixtures", 4 * MIB)
+                args = SimpleNamespace(binary=Path(os.environ["RAZOR_ACCEPTANCE_BINARY"]), cache_root=None,
+                    public_static=True, ram_algorithm=algorithm, ram_bytes=10 * MIB, block_bytes=MIB)
+                public_functional(args, fixtures, root, smoke=True)

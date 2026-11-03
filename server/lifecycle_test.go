@@ -2,9 +2,11 @@ package server_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -218,6 +220,7 @@ func TestCacheWriterQueueCancellationAndOverflow(t *testing.T) {
 		defer close(firstDone)
 		resp, _ := frontend.Client().Do(firstRequest)
 		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 		}
 	}()
@@ -289,14 +292,7 @@ func TestOversizedUnknownLengthFillFailsAndReleasesReservation(t *testing.T) {
 	s := lifecycleServer(t, origin.URL, cfg)
 	frontend := httptest.NewServer(s)
 	defer frontend.Close()
-	resp, err := frontend.Client().Get(frontend.URL + "/large")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("oversized candidate status=%d", resp.StatusCode)
-	}
+	assertFailedSharedHTTP(t, frontend.Client(), frontend.URL+"/large")
 	deadline := time.After(time.Second)
 	for {
 		st := s.Stats()
@@ -321,6 +317,7 @@ func TestCacheCommitFailureDoesNotPublishOrigin(t *testing.T) {
 		calls.Add(1)
 		w.Header().Set("Cache-Control", "public, max-age=60")
 		io.WriteString(w, "complete origin body")
+		w.(http.Flusher).Flush()
 	}))
 	defer origin.Close()
 	cfg := appconfig.GetDefaultConfig()
@@ -339,18 +336,25 @@ func TestCacheCommitFailureDoesNotPublishOrigin(t *testing.T) {
 	}
 	s := server.New(cfg, c, p)
 	defer s.Shutdown()
+	front := httptest.NewServer(s)
+	defer front.Close()
 	if err = c.Stripes[0].Fd.Close(); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
-		w := httptest.NewRecorder()
-		s.ServeHTTP(w, httptest.NewRequest("GET", "http://front.test/object", nil))
-		if w.Code != http.StatusBadGateway {
-			t.Fatalf("cache error published uncommitted origin: %d %q", w.Code, w.Body.String())
-		}
+	assertFailedSharedHTTP(t, front.Client(), front.URL+"/object")
+	// Storage failure outranks PURGE revocation: a known permanent error
+	// rejects subsequent fills before origin I/O, rather than enabling private streaming.
+	resp, err := front.Client().Get(front.URL + "/object")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusServiceUnavailable || string(body) == "complete origin body" {
+		t.Fatalf("known storage failure was not rejected: status=%d body=%q err=%v", resp.StatusCode, body, err)
 	}
 	st := s.Stats()
-	if calls.Load() != 2 || st.CacheWriteErrors == 0 || st.CacheWriters != 0 || st.BufferReserved != 0 {
+	if calls.Load() != 1 || st.Hits != 0 || st.CacheWriteErrors == 0 || st.CacheWriters != 0 || st.BufferReserved != 0 {
 		t.Fatalf("failed cache commit was reused or leaked: calls=%d stats=%+v", calls.Load(), st)
 	}
 	if err = s.Shutdown(); err == nil {
@@ -359,11 +363,21 @@ func TestCacheCommitFailureDoesNotPublishOrigin(t *testing.T) {
 }
 
 func TestSlowUploadCannotHoldOriginOrHandlerAfterEarlyResponse(t *testing.T) {
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var originErrors bytes.Buffer
+	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The early response abandons the upload, so this connection cannot be reused.
+		w.Header().Set("Connection", "close")
 		http.NewResponseController(w).EnableFullDuplex()
 		io.WriteString(w, "early")
 	}))
-	defer origin.Close()
+	origin.Config.ErrorLog = log.New(&originErrors, "", 0)
+	origin.Start()
+	defer func() {
+		origin.Close()
+		if originErrors.Len() != 0 {
+			t.Errorf("origin errors: %s", originErrors.String())
+		}
+	}()
 	cfg := appconfig.GetDefaultConfig()
 	cfg.TransactionTimeoutIn = 1
 	cfg.LogfileDir = t.TempDir()

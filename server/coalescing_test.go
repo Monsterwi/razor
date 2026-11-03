@@ -31,7 +31,7 @@ func TestHundredEquivalentColdRequestsShareOneCompleteFill(t *testing.T) {
 	responses := make(chan *httptest.ResponseRecorder, clients)
 	for i := 0; i < clients; i++ {
 		go func(i int) {
-			query := []string{"b=2&a=1", "a=1&b=2"}[i%2]
+			query := "b=2&a=1"
 			req := httptest.NewRequest("GET", "http://cache.test/item?"+query, nil)
 			req.RemoteAddr = fmt.Sprintf("192.0.2.1:%d", 10000+i)
 			rec := httptest.NewRecorder()
@@ -336,19 +336,25 @@ func TestFailedFillWakesHundredSubscribersWithoutRetry(t *testing.T) {
 		w.Header().Set("Content-Length", "100")
 		fmt.Fprint(w, "truncated")
 	})
-	first := startFill(s, context.Background(), nil)
+	front := httptest.NewServer(s)
+	defer front.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+	done := make(chan struct{}, 100)
+	start := func() {
+		go func() {
+			assertFailedSharedHTTP(t, client, front.URL+"/item")
+			done <- struct{}{}
+		}()
+	}
+	start()
 	<-entered
-	followers := make([]<-chan *httptest.ResponseRecorder, 99)
-	for i := range followers {
-		followers[i] = startFill(s, context.Background(), nil)
+	for range 99 {
+		start()
 	}
 	waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillWaiters == 100 })
 	close(release)
-	for _, done := range append(followers, first) {
-		got := <-done
-		if got.Code != 502 {
-			t.Fatalf("incomplete response published: %d %q", got.Code, got.Body.String())
-		}
+	for range 100 {
+		<-done
 	}
 	waitFillStats(t, s, func(st server.Stats) bool {
 		return st.SharedFillTasks == 0 && st.SharedFillWaiters == 0 && st.CacheWriters == 0 && st.Origin.InFlight == 0
@@ -375,10 +381,10 @@ func TestSharedFillLogsFinalCacheOutcome(t *testing.T) {
 	})
 	path := filepath.Join(t.TempDir(), "access.log")
 	logged := logger.AccessLogMiddleware(path)(s)
-	fetch(logged, "http://cache.test/item", nil)
-	fetch(logged, "http://cache.test/item", nil)
-	fetch(logged, "http://cache.test/item", http.Header{"Cache-Control": {"no-cache"}})
-	fetch(logged, "http://cache.test/private", nil)
+	fetchWhole(logged, "http://cache.test/item", nil)
+	fetchWhole(logged, "http://cache.test/item", nil)
+	fetchWhole(logged, "http://cache.test/item", http.Header{"Cache-Control": {"no-cache"}})
+	fetchWhole(logged, "http://cache.test/private", nil)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)

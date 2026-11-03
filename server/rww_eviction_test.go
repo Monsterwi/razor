@@ -115,7 +115,7 @@ func TestPreparedRangeBlockEvictedBeforeSendRecovers(t *testing.T) {
 				}
 				w.Header().Set("ETag", tag)
 				w.Header().Set("Cache-Control", "public,max-age=3600")
-				if r.Method == "GET" && r.Header.Get("Range") == "bytes=1048576-2097151" {
+				if start, end, ok := originInterval(r); r.Method == "GET" && ok && start <= 1<<20 && end >= (2<<20)-1 {
 					mu.Lock()
 					active++
 					gets++
@@ -208,7 +208,7 @@ func TestPreparedRangeBlockEvictedBeforeSendRecovers(t *testing.T) {
 			release.Do(func() { close(resume) })
 			for n := 0; n < scenario.readers; n++ {
 				got := <-held
-				if scenario.change != "" {
+				if scenario.change == "version" {
 					if got.err == nil || got.status != 200 || got.n != 1<<20 {
 						t.Fatalf("old stream must abort: %+v", got)
 					}
@@ -224,8 +224,11 @@ func TestPreparedRangeBlockEvictedBeforeSendRecovers(t *testing.T) {
 			if peak != 1 {
 				t.Fatalf("duplicate active block producer: %d", peak)
 			}
-			if scenario.change != "" && gets != before {
-				t.Fatalf("invalidated old block recovered: before=%d after=%d", before, gets)
+			if scenario.change == "purge" && gets != before+1 {
+				t.Fatalf("purged old response must recover the selected version once: before=%d after=%d", before, gets)
+			}
+			if scenario.change == "version" && gets != before+1 {
+				t.Fatalf("old missing version must be attempted once without retry: before=%d after=%d", before, gets)
 			}
 			if scenario.change == "" && gets < 2 {
 				t.Fatalf("did not exercise block recovery: GETs=%d", gets)

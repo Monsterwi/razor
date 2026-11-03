@@ -21,6 +21,9 @@ func (s *Server) produceFill(task *fillTask, r *http.Request, key []byte, resour
 	}
 	if result.err == nil {
 		result.err = s.cache.CheckFill(task.token)
+		if task.partial != nil && task.partial.full && errors.Is(result.err, cache.ErrPurged) {
+			result.err = nil // The original stream completed without cache publication.
+		}
 	}
 	task.publish(result)
 }
@@ -54,7 +57,11 @@ func (s *Server) fetchFill(task *fillTask, r *http.Request, key []byte, resource
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		requested := s.now()
-		resp, originHeaders, err := resources.proxy.ProxyWithOriginHeaders(originRequest)
+		origin, err := resources.proxy.SelectOrigin(originRequest)
+		if err != nil {
+			return fillResult{err: err}
+		}
+		resp, originHeaders, err := origin.ProxyWithOriginHeaders(originRequest)
 		if err != nil {
 			return fillResult{err: err}
 		}
@@ -87,6 +94,10 @@ func (s *Server) fetchFill(task *fillTask, r *http.Request, key []byte, resource
 			continue
 		}
 		_, cacheable := responsePolicy(info, s.now())
+		if cacheable && blockGETEligible(r) && strongRangeTag(originHeaders.Get("ETag")) && len(originHeaders.Values("ETag")) == 1 && resp.RawResponse.ContentLength >= 0 && identityEncoding(originHeaders) && len(resp.RawResponse.Trailer) == 0 && cacheSizeAllowed(resources.config.MaxCacheObjectBytes, key, info, resp.RawResponse.ContentLength) {
+			info.ResponseHeaders = resp.Header().Clone()
+			return fillResult{err: s.fillPartialGET(task, r, key, origin, resp.RawResponse, info, resources)}
+		}
 		fields, _ := varyFields(originHeaders)
 		representation := representationKey(key, r.Header, fields)
 		info.ResponseHeaders = resp.Header().Clone()
@@ -123,6 +134,7 @@ func (s *Server) fetchFill(task *fillTask, r *http.Request, key []byte, resource
 		vc.SetHTTPInfo(info)
 		fill := &cacheFill{vc: vc, cancel: cacheCancel, timeout: time.Duration(resources.config.CacheWriteTimeout) * time.Second, limit: int64(resources.config.MaxCacheObjectBytes), stats: &s.counters}
 		defer fill.abort(errors.New("cache fill incomplete"))
+		task.publishStream(vc)
 		buf := make([]byte, 32*1024)
 		for {
 			n, readErr := resp.RawBody().Read(buf)

@@ -25,6 +25,7 @@ type CacheReader struct {
 
 	// Multi-fragment state
 	version       uint64
+	purgeEpoch    uint64
 	versionSet    bool
 	fragmentIndex int
 	totalRead     int64  // Total payload bytes read across all fragments
@@ -65,9 +66,10 @@ func NewCacheReader(s *Stripe, key []byte) *CacheReader {
 	k := make([]byte, len(key))
 	copy(k, key)
 	return &CacheReader{
-		Stripe:   s,
-		Key:      k,
-		FirstKey: k,
+		Stripe:     s,
+		Key:        k,
+		FirstKey:   k,
+		purgeEpoch: s.OpenDir.purgeEpoch.Load(),
 	}
 }
 
@@ -291,6 +293,11 @@ func (r *CacheReader) handleRead() error {
 	}
 	if r.Stripe.closing || r.Stripe.disk == nil {
 		return ErrCacheClosed
+	}
+	if !r.versionSet {
+		if err := r.Stripe.OpenDir.checkPurge(r.purgeEpoch, r.FirstKey); err != nil {
+			return err
+		}
 	}
 	hit, _, d := r.Stripe.DirMgr.Get(r.Key)
 	if !hit {

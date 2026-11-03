@@ -15,8 +15,8 @@
 | 请求路径 | 共享单位 | 首次可发送时机 |
 | --- | --- | --- |
 | fresh 整对象 HIT | 已提交表示 | 校验读取后 |
-| 普通整对象 MISS | 整对象任务 | 完整提交后 |
-| 单 Range / 合格公共大 GET | manifest、每个缺块 | 首个所需块完整提交后 |
+| 普通整对象 MISS | 整对象任务与确切 writer | 共享头部通过准入、所需字节到达后 |
+| 单 Range / 合格普通 GET | 对象、segment 位图、chunk 及在途区间 | 校验响应头、所需字节到达后，见 [Partial Object Cache](partial_object_cache.md) |
 | 不可缓存请求 | 普通代理 | 按代理语义透传 |
 
 ## 生命周期与边界
@@ -24,15 +24,15 @@
 | 事项 | 契约 |
 | --- | --- |
 | 配置重载 | 原子安装；失败保留现配置；最多一个未排空旧 runtime；请求/生产者各持租约 |
-| 需重启项 | 存储、监听/证书、公共模式、块大小、RAM 策略等，见 [配置校验](../server/runtime.go) |
-| 失效 | 回源前捕获 FillToken，派生块继承；旧任务不能取得新代次后复活 |
+| 需重启项 | 存储、监听/证书、公共模式、RAM 策略等；块大小固定为 1 MiB，见 [配置校验](../server/runtime.go) |
+| 失效 | 回源前捕获 FillToken，块继承发布权围栏；PURGE 后旧任务不得重新发布，已开始响应可按原版本私有续流 |
 | 源站 | 块响应固定完整源站身份；普通整对象池假定副本可互换 |
 | 内存 | 请求、生产者、读写者和缓冲分别限额；不是统一 RSS 硬上限 |
 | I/O | 普通 ReadAt/WriteAt 与聚合写；无 io_uring/native AIO；提交不等于 fsync |
 
 缓存层的对象模型、磁盘布局和读写路径见 [缓存设计](cache_design.md)。
 
-设计入口：[合并与块缓存](cache_fill_design.md) · [RWW](rww_implementation.md) · [RAM](ram_cache.md) · [存储恢复](cache_storage_format.md)。
+设计入口：[部分对象缓存](partial_object_cache.md) · [任务与身份](cache_fill_design.md) · [RWW](rww_implementation.md) · [RAM](ram_cache.md) · [存储恢复](cache_storage_format.md)。
 
 [PlantUML 图源与 SVG](diagrams/)同目录保存（渲染工具 1.2026.9）；修改图源后重新生成。仅在本机渲染，不依赖在线 UML 服务：
 

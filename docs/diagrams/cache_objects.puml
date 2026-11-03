@@ -8,23 +8,29 @@ skinparam ArrowColor #334155
 skinparam classBackgroundColor #EFF6FF
 top to bottom direction
 hide methods
-class "清单（独立缓存对象）" as M {
-  Version / BlockSize / Total
-  ETag / Origin / Variant / Incarnation
+class "对象元数据（缓存内部记录）" as M {
+  Version / ChunkBytes / Total
+  ETag / Origin / Variant / Generation
 }
-class "逻辑块（独立缓存对象）" as B {
-  块键：URL + 源站/变体/版本/布局 + 块号
-  默认 1 MiB，可配 64 KiB–8 MiB
+class "对象分段（segment 覆盖记录）" as S {
+  内容身份 / segment 编号
+  64 个 chunk 对应一个 uint64 完成位图
+}
+class "缓存块（chunk 独立数据记录）" as B {
+  块键：URL + 内容身份 + 块号
+  固定 1 MiB，末块按总长截断
 }
 class "Doc 片段（存储记录）" as F {
   72 B 头 + 元数据 + 正文
   正文每片最多 1 MiB
 }
-M "1" ..> "0..N" B : 按版本与块号派生键\n不记录已缓存块列表
-B "1" *-- "1..N" F : 一个块内按片键查找\n同卷，物理位置可不连续
+M "1" ..> "0..N" S : 按身份与 segment 编号派生键\n覆盖记录按需读取
+M "1" ..> "0..N" B : 按身份与块号派生键
+S "1" ..> "0..64" B : 位图规划；读取仍须校验\n数据与目录提交后才置位
+B "1" *-- "1" F : 当前块正文不超过一个 fragment
 note right of F
-  整对象与清单也复用 Doc 存储
-  第 0 片最后提交
-  整个逻辑块提交后才允许 HTTP RWW
+  对象元数据与 segment 记录也复用 Doc
+  普通整对象可包含多个 fragment，片 0 最后提交
+  HTTP RWW 在头部校验后即可读取块内在途字节
 end note
 @enduml

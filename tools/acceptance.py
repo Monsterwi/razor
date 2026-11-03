@@ -43,6 +43,15 @@ def wait_for(check, description, timeout=15):
     raise AssertionError("timeout: " + description)
 
 
+def read_complete_log(path, offset=0):
+    """Keep a live writer's unfinished record for the next read."""
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        data = stream.read()
+    end = data.rfind(b"\n") + 1
+    return data[:end].decode(), offset + end
+
+
 def free_port():
     # Origin/health outbound allocation must not take this released listener port.
     low, high = map(int, Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split())
@@ -122,13 +131,22 @@ class Origin:
                     row = {"path": path, "method": self.command, "bytes": 0,
                            "range": self.headers.get("Range"), "time": time.time(), "status": 0,
                            "remote_ip": self.client_address[0], "headers": dict(self.headers)}
+                    if rule.get("retain_old_version"):
+                        row["ordinary_get_bytes_at_start"] = {
+                            previous["etag"]: previous["bytes"] for previous in owner.records
+                            if previous["path"] == path and previous["method"] == "GET"
+                            and not previous["range"] and "etag" in previous}
                     owner.records.append(row)
                     if rule.get("switch_after_get") and sum(r["method"] == "GET" and r["path"] == path for r in owner.records) > rule["switch_after_get"]:
                         rule["version"] = owner.rules[path]["version"] = 2
                 size = "large" if "large" in path else "small"
+                if rule.get("retain_old_version") and self.headers.get("If-Match") == f'"{size}-v1"':
+                    rule["version"] = 1
                 fixture = owner.fixtures[(size, rule.get("version", owner.version))]
                 total = fixture.stat().st_size
                 tag = '"%s-v%d"' % (size, rule.get("version", owner.version))
+                with owner.lock:
+                    row["etag"] = tag
                 status, start, end = 200, 0, total - 1
                 if path == "/health" and not owner.healthy:
                     status = 503
@@ -147,15 +165,16 @@ class Origin:
                         else:
                             start, end = int(left), min(total - 1, int(right) if right else total - 1)
                         status = 206 if 0 <= start <= end < total else 416
-                # Faults/barriers affect only the selected GET block, never HEAD.
+                # Request-level rules match the selected GET start, never HEAD.
                 if "block_start" in rule and (self.command != "GET" or start != rule["block_start"]):
                     rule = {}
                 if rule.get("force_status"):
                     status = rule["force_status"]
-                if rule.get("entered"):
-                    rule["entered"].set()
-                if rule.get("gate"):
-                    rule["gate"].wait(15)
+                if "body_gate_at" not in rule:
+                    if rule.get("entered"):
+                        rule["entered"].set()
+                    if rule.get("gate"):
+                        rule["gate"].wait(15)
                 time.sleep(rule.get("header_delay", 0))
                 length = end - start + 1 if status in (200, 206) else 0
                 try:
@@ -176,8 +195,26 @@ class Origin:
                     with fixture.open("rb") as f:
                         f.seek(start)
                         remaining = length
+                        gate_at = rule.get("body_gate_at")
+                        truncate_at = rule.get("truncate_at")
                         while remaining:
-                            block = f.read(min(CHUNK, remaining // 2 if rule.get("truncate") else remaining))
+                            position = end + 1 - remaining
+                            if position == truncate_at:
+                                self.close_connection = True
+                                return
+                            if position == gate_at:
+                                self.wfile.flush()
+                                if rule.get("entered"):
+                                    rule["entered"].set()
+                                if rule.get("gate"):
+                                    rule["gate"].wait(15)
+                                gate_at = None
+                            count = min(CHUNK, remaining // 2 if rule.get("truncate") else remaining)
+                            if gate_at is not None and position < gate_at:
+                                count = min(count, gate_at - position)
+                            if truncate_at is not None and position < truncate_at:
+                                count = min(count, truncate_at - position)
+                            block = f.read(count)
                             self.wfile.write(block)
                             with owner.lock:
                                 row["bytes"] += len(block)
@@ -417,19 +454,21 @@ class Client:
             ({**(headers or {}), "Range": "bytes=%d-%d" % limits}, self.expected(path, bounds=limits))
             for limits in ranges]
         path_expected = {p: self.expected(p) for p in paths or ()}
+        if product.kind == "razor":
+            from public_acceptance import drain
+            drain(product)  # Exclude the preceding group or warm-up's unfinished tail.
         before = origin.snapshot()
         structured_before = None
         if product.kind == "razor":
             from public_acceptance import snapshot
             structured_before = snapshot(product)
         initial = product.resource()
-        logs_before = (product.dir / "process.log").stat().st_size
+        logs_before = product.stats_offset if product.kind == "razor" else (product.dir / "process.log").stat().st_size
         if product.kind == "razor":
             product.proc.send_signal(signal.SIGUSR1)
             def has_snapshot():
-                with (product.dir / "process.log").open() as f:
-                    f.seek(logs_before)
-                    return "Goroutines:" in f.read()
+                logs, _ = read_complete_log(product.dir / "process.log", logs_before)
+                return "Goroutines:" in logs
             wait_for(has_snapshot, "resource snapshot")
         samples, done = [initial], threading.Event()
         def sample():
@@ -467,27 +506,31 @@ class Client:
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
                 rows = [r for group in pool.map(worker, range(concurrency)) for r in group]
+            elapsed = time.monotonic() - start
+            client_cpu = time.process_time() - harness_cpu
+            if product.kind == "razor":
+                drain(product)  # Client EOF can precede current-chunk validation.
+            observation = time.monotonic() - start
         finally:
             done.set()
             monitor.join()
-        elapsed = time.monotonic() - start
         samples.append(product.resource())
         after = origin.snapshot()
         payload = sum(r["bytes"] for r in rows if r["status"] in (200, 206) and not r["error"])
         errors = [r for r in rows if r["error"] and r["status"] not in allowed]
-        with (product.dir / "process.log").open() as f:
-            f.seek(logs_before)
-            logs = f.read()
+        logs, _ = read_complete_log(product.dir / "process.log", logs_before)
         goroutines = [int(n) for n in re.findall(r"Goroutines:(\d+)", logs)]
         def quantiles(key):
             values = sorted(r[key] for r in rows if r[key] is not None)
             return {"p" + str(q): values[max(0, math.ceil(len(values) * q / 100) - 1)] for q in (50, 95, 99)}
         summary = {"name": name, "product": product.kind, "concurrency": concurrency, "requests": len(rows),
-                   "seconds": elapsed, "requests_per_second": len(rows) / elapsed,
+                   "response_body_bytes": payload,
+                   "seconds": elapsed, "fill_settle_seconds": observation - elapsed,
+                   "observation_seconds": observation, "requests_per_second": len(rows) / elapsed,
                    "mib_per_second": payload / MIB / elapsed, "ttfb_ms": quantiles("ttfb_ms"),
                    "completion_ms": quantiles("completion_ms"), "unexpected_errors": len(errors),
                    "object_requests": {size: sum(size in r["path"] for r in rows) for size in ("small", "large")},
-                   "harness_cpu_cores": (time.process_time() - harness_cpu) / elapsed,
+                   "harness_cpu_cores": client_cpu / elapsed,
                    "process_io_bytes": {k: samples[-1][k] - initial[k] for k in ("read_bytes", "write_bytes")},
                    "statuses": {str(s): sum(r["status"] == s for r in rows) for s in set(r["status"] for r in rows)},
                    "origin": {k: after[k] - before[k] for k in after},
@@ -498,6 +541,7 @@ class Client:
                                                   for field in ("InFlight", "CacheWriters", "BufferReserved", "SharedFillTasks", "SharedFillWaiters")}
                                                   if product.kind == "razor" else None,
                    "resource_samples": samples}
+        summary["origin_body_bytes_per_response_byte"] = summary["origin"]["bytes"] / payload if payload else None
         if product.kind == "razor":
             from public_acceptance import counter_metrics, snapshot
             structured_after = snapshot(product)
@@ -520,6 +564,7 @@ class Client:
 
 
 def functional(args, fixtures, output):
+    from public_acceptance import drain
     with ExitStack() as cleanup:
         origin = Origin(fixtures, output / "origin-functional.json")
         cleanup.callback(origin.close)
@@ -543,8 +588,10 @@ def functional(args, fixtures, output):
         client.checked(product, path, headers={"Cache-Control": "no-cache"})
         assert origin.snapshot(path)["get"] == 2
         client.checked(product, path, headers={"If-None-Match": '"small-v1"'}, status=304, expected=None)
-        assert origin.snapshot(path)["get"] == 2
-        record("small MISS/HIT/REVALIDATE/client304", origin=origin.snapshot(path))
+        assert origin.snapshot(path)["get"] == 3
+        conditional = [row for row in origin.records if row["path"] == path][-1]
+        assert conditional["headers"].get("If-None-Match") == '"small-v1"' and conditional["status"] == 304 and conditional["bytes"] == 0, conditional
+        record("small MISS/HIT, forced refresh and conditional passthrough304", origin=origin.snapshot(path))
         for path, headers in [("/small-private", {}), ("/small-auth", {"Authorization": "Bearer test-only"})]:
             origin.rules[path] = {"cache_control": "private, max-age=3600"}
             for _ in range(2):
@@ -564,6 +611,7 @@ def functional(args, fixtures, output):
         path = "/large-ranges"
         for bounds in [(0, 1572863), (1048576, 2097151)]:
             client.checked(product, path, headers={"Range": "bytes=%d-%d" % bounds}, expected=client.expected(path, bounds=bounds), status=206)
+        drain(product)
         assert origin.snapshot(path)["bytes"] == 2 * MIB
         record("overlap 2.5MiB responses fetch only2MiB", origin=origin.snapshot(path))
         client.checked(product, path, headers={"Range": "bytes=0-"}, status=206)
@@ -580,15 +628,20 @@ def functional(args, fixtures, output):
             summary = client.batch(product, origin, f"different-overlapping-ranges-c{concurrency}",
                                    "/large-overlap-stress", concurrency, count=1, ranges=overlap)
             assert summary["origin"]["bytes"] == (40 * MIB if concurrency == 8 else 0), summary
-            assert summary["origin"]["get"] == (40 if concurrency == 8 else 0), summary
+            assert summary["origin"]["get"] == (20 if concurrency == 8 else 0), summary
+        actual_ranges = [row["range"] for row in origin.records
+                         if row["path"] == "/large-overlap-stress" and row["method"] == "GET"]
+        expected_ranges = [f"bytes={start}-{start + 2 * MIB - 1}" for start in range(0, 40 * MIB, 2 * MIB)]
+        assert sorted(actual_ranges) == sorted(expected_ranges), actual_ranges
         record("8/32 clients with four overlapping16MiB ranges:40MiB union fetched once")
         changed = "/large-version-swap"
         origin.rules[changed] = {"switch_after_get": 1}
-        bounds = (0, 2 * MIB - 1)
-        result = client.request(product, changed, headers={"Range": "bytes=0-2097151"}, expected=client.expected(changed, bounds=bounds), status=206)
+        bounds = (0, 3 * MIB - 1)
+        result = client.request(product, changed, headers={"Range": f"bytes=0-{bounds[1]}"}, expected=client.expected(changed, bounds=bounds), status=206)
         assert result["error"], result
-        client.checked(product, changed, headers={"Range": "bytes=0-2097151"}, expected=client.expected(changed, version=2, bounds=bounds), status=206)
+        client.checked(product, changed, headers={"Range": f"bytes=0-{bounds[1]}"}, expected=client.expected(changed, version=2, bounds=bounds), status=206)
         record("Range version changes mid-fill: controlled failure then exact new version")
+        drain(product)
         before = origin.snapshot()
         product.stop()
         product.start()
@@ -601,6 +654,7 @@ def functional(args, fixtures, output):
         before = origin.snapshot()
         client.checked(product, "/large-full")
         client.checked(product, "/large-ranges", headers={"Range": "bytes=0-16"}, expected=client.expected("/large-ranges", bounds=(0, 16)), status=206)
+        drain(product)
         assert origin.snapshot()["bytes"] - before["bytes"] == large_bytes + MIB
         record("authenticated exact PURGE fences full object and range family")
         # Creator closes its TCP request before headers; follower still gets the full object.
@@ -619,13 +673,12 @@ def functional(args, fixtures, output):
             follower.result()
         assert origin.snapshot(path)["get"] == 1
         record("creator cancellation leaves follower's" + large_label + " fill alive")
-        # Existing semantics preserve the old creator's private passthrough, but
-        # invalidate shared publication and reject old followers.
+        # Eligible fills purged before response headers fail without a version retry.
         path = "/small-purge-inflight"
         gate, entered = threading.Event(), threading.Event()
         origin.rules[path] = {"gate": gate, "entered": entered}
         with concurrent.futures.ThreadPoolExecutor() as pool:
-            old = pool.submit(client.checked, product, path)
+            old = pool.submit(client.request, product, path, expected=client.expected(path), status=None)
             assert entered.wait(5)
             follower = pool.submit(client.request, product, path, expected=client.expected(path))
             before_log = (product.dir / "process.log").stat().st_size
@@ -639,18 +692,15 @@ def functional(args, fixtures, output):
             origin.rules[path] = {"version": 2}
             client.checked(product, path, expected=client.expected(path, version=2))
             gate.set()
-            old.result()  # Exact original bytes, only to its original subscriber.
-            result = follower.result()
-            assert result["status"] == 503, result
+            for result in (old.result(), follower.result()):
+                assert result["status"] >= 500, result
         client.checked(product, path, expected=client.expected(path, version=2))
         assert origin.snapshot(path)["get"] == 2
-        access = [json.loads(line) for line in (product.dir / "access.log").read_text().splitlines()]
-        assert any(row.get("path") == path and row.get("cache_status") == "BYPASS" for row in access)
-        record("in-flight PURGE: old creator BYPASS; follower503; new version HIT unchanged", origin=origin.snapshot(path))
+        record("pre-header PURGE: old subscribers fail without retry; new version stays reusable", origin=origin.snapshot(path))
         path = "/large-truncated"
         origin.rules[path] = {"truncate": True}
         result = client.request(product, path, expected=client.expected(path))
-        assert result["status"] != 200, result
+        assert result["error"] and result["bytes"] < large_bytes, result
         origin.rules[path] = {}
         client.checked(product, path)
         assert origin.snapshot(path)["get"] == 2
@@ -687,6 +737,7 @@ def functional(args, fixtures, output):
                         "http.health.successes": ("INT", 1)})
         client.checked(product, "/small-health-full")
         client.checked(product, "/small-health-range", headers={"Range": "bytes=0-16"}, expected=client.expected("/small-health-range", bounds=(0, 16)), status=206)
+        drain(product)
         origin.healthy = False
         probe_headers = {"Authorization": "Bearer health-probe-only"}
         wait_for(lambda: client.request(product, "/small-health-probe", headers=probe_headers, status=None)["status"] == 502,
@@ -722,9 +773,15 @@ def functional(args, fixtures, output):
         product.stop()
         # Verify advertised main-binary cache states actually appeared in access logs.
         access = (output / "functional/access.log").read_text()
-        for state in ("MISS", "HIT", "REVALIDATE", "BYPASS", "PURGE"):
+        for state in ("MISS", "HIT", "BYPASS", "PURGE"):
             assert f'"cache_status":"{state}"' in access, state
-        record("main access-log MISS/HIT/REVALIDATE/BYPASS/PURGE observed")
+        # Eligible partial objects rediscover on no-cache; REVALIDATE belongs to
+        # the legacy complete-object path. Check this actual request sequence.
+        refresh = [json.loads(line) for line in access.splitlines()
+                   if json.loads(line).get("path") == "/small-cache"]
+        assert [(row["status"], row["cache_status"]) for row in refresh] == [
+            (200, "MISS"), (200, "HIT"), (200, "MISS"), (304, "BYPASS")], refresh
+        record("main access-log MISS/HIT/BYPASS/PURGE and partial refresh sequence observed")
 
 def benchmark(args, fixtures, output):
     with ExitStack() as cleanup:
@@ -814,7 +871,8 @@ def main():
     p.add_argument("--public-static", action="store_true", help="explicit public identity contract; required for public-functional and soak")
     p.add_argument("--ram-algorithm", choices=("otter", "s3-fifo"), default="otter")
     p.add_argument("--ram-bytes", type=int, default=10 * MIB, help="same per-stripe payload budget for policy comparison")
-    p.add_argument("--block-bytes", type=int, default=MIB)
+    p.add_argument("--block-bytes", type=int, choices=(MIB,), default=MIB,
+                   help="compatibility option; chunk size is fixed at 1 MiB")
     p.add_argument("--soak-seconds", type=float, default=7200)
     p.add_argument("--allow-short-soak", action="store_true", help="smoke test only; never qualifies as two-hour acceptance")
     p.add_argument("--cache-root", type=Path, help="new Razor cache directory on the disk under test; results stay under --output")

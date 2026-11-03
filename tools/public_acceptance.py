@@ -11,7 +11,7 @@ import socket
 import threading
 import time
 
-from acceptance import CHUNK, MIB, Client, Origin, Product, save, wait_for
+from acceptance import CHUNK, MIB, Client, Origin, Product, read_complete_log, save, wait_for
 
 DRAIN_FIELDS = ("InFlight", "Queued", "CacheWriters", "CacheQueued", "RangeReaders", "RangeReaderQueued",
                 "DiskQueued", "DiskBufferedBytes", "BufferReserved", "SharedFillTasks", "SharedFillWaiters", "RetiredRuntimes")
@@ -25,15 +25,13 @@ def snapshot(product):
     found = []
     def ready():
         nonlocal offset
-        with (product.dir / "process.log").open() as stream:
-            stream.seek(offset)
-            for line in stream:
-                marker = "HTTP resource stats JSON: "
-                if marker in line:
-                    sample = json.loads(line.split(marker, 1)[1])
-                    if sample["SnapshotUnixNano"] >= requested:
-                        found.append(sample)
-            offset = stream.tell()
+        logs, offset = read_complete_log(product.dir / "process.log", offset)
+        for line in logs.splitlines():
+            marker = "HTTP resource stats JSON: "
+            if marker in line:
+                sample = json.loads(line.split(marker, 1)[1])
+                if sample["SnapshotUnixNano"] >= requested:
+                    found.append(sample)
         return bool(found)
     wait_for(ready, "structured resource snapshot")
     product.stats_offset = offset
@@ -59,7 +57,8 @@ def record(output, evidence, name, **details):
 def barrier_response(product, origin, client, path, full=False):
     block = product.args.block_bytes
     entered, gate = threading.Event(), threading.Event()
-    origin.rules[path] = {"block_start": block, "entered": entered, "gate": gate}
+    first_bytes = 6 << 10 if full else block
+    origin.rules[path] = {"body_gate_at": first_bytes, "entered": entered, "gate": gate}
     bounds = None if full else (0, 3 * block - 1)
     expected = client.expected(path, bounds=bounds)
     c = http.client.HTTPConnection("127.0.0.1", product.port, timeout=8)
@@ -70,11 +69,14 @@ def barrier_response(product, origin, client, path, full=False):
         c.request("GET", path, headers=headers)
         response = c.getresponse()
         assert response.status == (200 if full else 206)
-        prefix = response.read(block)
-        assert len(prefix) == block and entered.wait(5), "first committed block or next producer missing"
+        prefix = response.read(first_bytes - 1 if full else first_bytes)
+        assert len(prefix) == (first_bytes - 1 if full else first_bytes) and entered.wait(5), "RWW prefix or body gate missing"
         assert not gate.is_set(), "barrier unexpectedly released"
+        assert origin.snapshot(path)["bytes"] == first_bytes, origin.snapshot(path)
+        if full:
+            assert origin.snapshot(path)["get"] == 1 and origin.snapshot(path)["head"] == 0, origin.snapshot(path)
         digest, length = hashlib.sha256(prefix), len(prefix)
-        assert digest.hexdigest() == client.expected(path, bounds=(0, block - 1))[1]
+        assert digest.hexdigest() == client.expected(path, bounds=(0, len(prefix) - 1))[1]
         gate.set()
         while True:
             body = response.read(CHUNK)
@@ -83,10 +85,122 @@ def barrier_response(product, origin, client, path, full=False):
             digest.update(body)
             length += len(body)
         assert (length, digest.hexdigest()) == expected, (length, expected)
-        return {"status": response.status, "bytes": length, "sha256": digest.hexdigest(), "first_block_before_release": True}
+        return {"status": response.status, "bytes": length, "sha256": digest.hexdigest(), "prefix_before_release": len(prefix), "origin": origin.snapshot(path)}
     finally:
         gate.set()
         c.close()
+
+
+def purge_active_response(product, origin, client, full=False, prefix=False, retain_old=True, old_finishes_last=False):
+    """Both generations have real client bytes before the old stream is released."""
+    path = "/large-purge-" + ("prefix" if prefix else "exact") + ("-get/item" if full else "-range/item")
+    if not retain_old:
+        assert not full
+        path += "-unavailable"
+    total = client.expected(path)[0]
+    start, end = (0, total - 1) if full else (17, 3 * MIB + 18)
+    gate_at = 128 << 10
+    entered, gate = threading.Event(), threading.Event()
+    new_entered, new_gate = threading.Event(), threading.Event()
+    origin.rules[path] = {"body_gate_at": gate_at, "entered": entered, "gate": gate}
+    old_conn = http.client.HTTPConnection("127.0.0.1", product.port, timeout=8)
+    new_conn = http.client.HTTPConnection("127.0.0.1", product.port, timeout=8)
+
+    def finish(response, first):
+        digest, length = hashlib.sha256(first), len(first)
+        while body := response.read(CHUNK):
+            digest.update(body)
+            length += len(body)
+        return length, digest.hexdigest()
+
+    try:
+        headers = {"Host": "bench.local", "Accept-Encoding": "identity"}
+        old_conn.request("GET", path, headers={**headers, **({} if full else {"Range": f"bytes={start}-{end}"})})
+        old = old_conn.getresponse()
+        assert old.status == (200 if full else 206), old.status
+        assert old.getheader("ETag") == '"large-v1"', old.getheaders()
+        assert old.getheader("Content-Length") == str(end - start + 1), old.getheaders()
+        assert old.getheader("Content-Range") == (None if full else f"bytes {start}-{end}/{total}"), old.getheaders()
+        first = old.read(gate_at - start - 1)
+        assert (len(first), hashlib.sha256(first).hexdigest()) == client.expected(path, bounds=(start, gate_at - 2))
+        assert entered.wait(5) and not gate.is_set(), "old origin must still be paused inside its first chunk"
+        assert origin.snapshot(path)["bytes"] == gate_at, origin.snapshot(path)
+        target = path.rsplit("/", 1)[0] + "/" if prefix else path
+        client.checked(product, target, method="PURGE", headers={"Authorization": "Bearer acceptance-local-token"}, expected=None)
+        origin.rules[path] = {"version": 2, "retain_old_version": retain_old, "body_gate_at": gate_at,
+                              "entered": new_entered, "gate": new_gate}
+        new_conn.request("GET", path, headers=headers)
+        new = new_conn.getresponse()
+        assert new.status == 200 and new.getheader("ETag") == '"large-v2"', new.getheaders()
+        assert new.getheader("Content-Length") == str(total) and new.getheader("Content-Range") is None, new.getheaders()
+        new_first = new.read(gate_at - 1)
+        assert (len(new_first), hashlib.sha256(new_first).hexdigest()) == client.expected(path, version=2, bounds=(0, gate_at - 2))
+        assert new_entered.wait(5) and not gate.is_set(), "new generation failed to start independently"
+        if old_finishes_last:
+            new_gate.set()
+            assert finish(new, new_first) == client.expected(path, version=2)
+            wait_for(lambda: any(row["path"] == path and row.get("etag") == '"large-v2"'
+                                 and not row["range"] and "end" in row for row in origin.records),
+                     "new generation finishes before the old stream resumes")
+        gate.set()
+        if full:
+            wait_for(lambda: any(row["path"] == path and row.get("etag") == '"large-v1"'
+                                 and not row["range"] and row["bytes"] == total for row in origin.records),
+                     "old GET producer finishes while its client is paused")
+        length, digest = finish(old, first)
+        if retain_old:
+            assert (length, digest) == client.expected(path, bounds=(start, end)), (length, old.getheaders())
+        else:
+            assert 0 < length < end - start + 1, length
+            assert (length, digest) == client.expected(path, bounds=(start, start + length - 1))
+        if not old_finishes_last:
+            assert not new_gate.is_set(), "old subscription must leave while the new producer is active"
+            new_gate.set()
+            assert finish(new, new_first) == client.expected(path, version=2)
+        wait_for(lambda: all("end" in row for row in origin.records if row["path"] == path), "both generations' origin requests finished")
+        drain(product)
+        before = origin.snapshot(path)
+        repair_bytes = 0
+        if full:
+            rows = [row for row in origin.records if row["path"] == path]
+            ordinary = [row for row in rows if row["method"] == "GET" and not row["range"]]
+            assert [(row["etag"], row["bytes"]) for row in ordinary] == [('"large-v1"', total), ('"large-v2"', total)], ordinary
+            assert before["head"] == 0, before
+            repaired = set()
+            for row in rows:
+                if not row["range"]:
+                    continue
+                left, right = map(int, row["range"].removeprefix("bytes=").split("-"))
+                assert row["method"] == "GET" and row["status"] == 206 and row["headers"].get("If-Match") == '"large-v1"', row
+                assert 0 <= left <= right < total and left % MIB == 0 and right == min(left + MIB, total) - 1, row
+                assert right < row["ordinary_get_bytes_at_start"].get('"large-v1"', 0), row
+                assert left not in repaired and row["bytes"] == right - left + 1, row
+                repaired.add(left)
+                repair_bytes += row["bytes"]
+            assert before["get"] == 2 + len(repaired) and before["bytes"] == 2 * total + repair_bytes, before
+        else:
+            assert before["get"] == 3 and before["bytes"] == total + (min(total, 4 * MIB) if retain_old else 2 * MIB), before
+            old_ranges = [row for row in origin.records if row["path"] == path and row["method"] == "GET" and row["range"]]
+            assert [row["range"] for row in old_ranges] == [f"bytes=0-{2 * MIB - 1}", f"bytes={2 * MIB}-{min(total, 4 * MIB) - 1}"], old_ranges
+            assert all(row["headers"].get("If-Match") == '"large-v1"' for row in old_ranges), old_ranges
+        if not retain_old:
+            failed = [row for row in origin.records if row["path"] == path and row["status"] == 412]
+            assert len(failed) == 1 and failed[0]["headers"].get("If-Match") == '"large-v1"', failed
+        client.checked(product, path, expected=client.expected(path, version=2))
+        hot = client.checked(product, path, headers={"Range": "bytes=7-23"}, status=206,
+                             expected=client.expected(path, version=2, bounds=(7, 23)))
+        hot_headers = {name.lower(): value for name, value in hot["headers"].items()}
+        assert hot_headers["etag"] == '"large-v2"' and hot_headers["content-length"] == "17", hot
+        assert hot_headers["content-range"] == f"bytes 7-23/{total}", hot
+        assert origin.snapshot(path) == before, (before, origin.snapshot(path))
+        return {"path": path, "old_status": old.status, "old_bytes": length, "old_sha256": digest,
+                "old_completed": retain_old, "client_prefix_before_purge": len(first),
+                "origin": before, "old_chunk_repair_bytes": repair_bytes, "new_generation_still_hot": True}
+    finally:
+        gate.set()
+        new_gate.set()
+        old_conn.close()
+        new_conn.close()
 
 
 def public_functional(args, fixtures, output, smoke=False):
@@ -104,7 +218,11 @@ def public_functional(args, fixtures, output, smoke=False):
         for _ in range(2):
             client.checked(product, "/small-public")
         assert origin.snapshot("/small-public")["bytes"] == 256 << 10
-        record(output, evidence, "256KiB whole-object public MISS/HIT")
+        before = origin.snapshot("/small-public")
+        client.checked(product, "/small-public", headers={"Range": "bytes=17-65535"}, status=206,
+                       expected=client.expected("/small-public", bounds=(17, 65535)))
+        assert before == origin.snapshot("/small-public") and before["get"] == 1 and before["head"] == 0
+        record(output, evidence, "256KiB GET and Range share partial chunks", origin=before)
         left, right = ((2, 1) if smoke else (16, 8))
         path = "/large-union"
         for start, end, expected_origin in ((0, left * MIB, left * MIB), (right * MIB, (left + right) * MIB, (left + right) * MIB)):
@@ -124,13 +242,25 @@ def public_functional(args, fixtures, output, smoke=False):
         record(output, evidence, "full GET and Range reuse identical blocks", origin=before)
         for full in (False, True):
             details = barrier_response(product, origin, client, "/large-barrier-" + str(full), full)
-            record(output, evidence, "real HTTP committed first block before blocked second: " + ("GET" if full else "Range"), **details)
+            record(output, evidence, "real HTTP RWW prefix before blocked origin: " + ("GET" if full else "Range"), **details)
+        for prefix in (False, True):
+            for full in (False, True):
+                details = purge_active_response(product, origin, client, full=full, prefix=prefix)
+                record(output, evidence, ("prefix" if prefix else "exact") + " PURGE after client prefix: old " +
+                       ("GET" if full else "Range") + " completes and cannot republish over new generation", **details)
+        details = purge_active_response(product, origin, client, retain_old=False)
+        record(output, evidence, "PURGE with unavailable old version: old Range fails without retry and new GET completes", **details)
         for fault in ("truncate", "force_status"):
             path = "/large-body-error-" + fault
-            origin.rules[path] = {"block_start": block, fault: True if fault == "truncate" else 200}
+            origin.rules[path] = ({"truncate_at": block + CHUNK} if fault == "truncate"
+                                  else {"block_start": 2 * block, "force_status": 200})
             row = client.request(product, path, headers={"Range": f"bytes=0-{3 * block - 1}"}, status=206,
                                  expected=client.expected(path, bounds=(0, 3 * block - 1)), case="expected-injected-body-error")
-            assert row["status"] == 206 and row["error"] and block <= row["bytes"] < 3 * block, row
+            minimum = block if fault == "truncate" else 2 * block
+            assert row["status"] == 206 and row["error"] and minimum <= row["bytes"] < 3 * block, row
+            headers = {name.lower(): value for name, value in row["headers"].items()}
+            assert headers["content-length"] == str(3 * block), row
+            assert headers["content-range"] == f"bytes 0-{3 * block - 1}/{large}", row
             record(output, evidence, "later " + fault + " detected by real body reader", response=row)
         # Gate one block, wait for 100 real TCP clients to subscribe before release.
         drain(product)
@@ -185,27 +315,38 @@ def public_functional(args, fixtures, output, smoke=False):
                 gate.set()
             owner.result()
         record(output, evidence, "unknown headers do not join or create duplicate active producer")
-        # Last subscriber cancellation while the next producer is blocked.
+        # Last subscriber cancellation while the merged response is held inside its body.
         path = "/large-last-cancel"
         entered, gate = threading.Event(), threading.Event()
-        origin.rules[path] = {"block_start": block, "entered": entered, "gate": gate}
+        gate_at = block + (16 << 10)
+        origin.rules[path] = {"body_gate_at": gate_at, "entered": entered, "gate": gate}
         c = http.client.HTTPConnection("127.0.0.1", product.port, timeout=8)
         try:
             c.request("GET", path, headers={"Host": "bench.local", "Accept-Encoding": "identity", "Range": f"bytes=0-{3 * block - 1}"})
             response = c.getresponse()
-            prefix = response.read(block)
-            assert len(prefix) == block and entered.wait(5)
+            prefix = response.read(gate_at)
+            assert len(prefix) == gate_at and entered.wait(5)
             c.sock.shutdown(socket.SHUT_RDWR)
             response.close()
             c.close()
+            wait_for(lambda: snapshot(product)["stats"]["InFlight"] == 0, "last reader handler released")
+            held = origin.snapshot(path)
+            assert held["get"] == 1 and held["bytes"] == gate_at, held
         finally:
             gate.set()
             c.close()
         final = drain(product)
+        wait_for(lambda: all("end" in row for row in origin.records if row["path"] == path), "cancelled reader's current chunk finished")
+        completed = origin.snapshot(path)
+        assert completed == {"requests": 2, "get": 1, "head": 1, "bytes": 2 * block}, completed
+        client.checked(product, path, headers={"Range": f"bytes=0-{2 * block - 1}"}, status=206,
+                       expected=client.expected(path, bounds=(0, 2 * block - 1)))
+        assert origin.snapshot(path) == completed, "current chunk was discarded after last reader left"
         assert final["stats"]["HeapAlloc"] > 0 and "GCCount" in final["stats"]
-        assert origin.snapshot(path)["get"] <= 2, origin.snapshot(path)
-        record(output, evidence, "reader cancellation bounds prefetch and drains", drain=final)
+        record(output, evidence, "reader cancellation completes current chunk, stops before next and drains", drain=final,
+               origin_before_release=held, origin_after_completion=completed)
         # Clean restart reuses committed blocks; PURGE forces a new generation.
+        drain(product)
         path = "/large-union"
         before = origin.snapshot(path)
         product.stop()
@@ -220,6 +361,7 @@ def public_functional(args, fixtures, output, smoke=False):
         product.reload({"http.health.interval": ("INT", 1), "http.health.failures": ("INT", 1), "http.health.successes": ("INT", 1)})
         # Establish the block through the current runtime before removing the origin.
         client.checked(product, path, headers={"Range": f"bytes=0-{block - 1}"}, status=206, expected=expected)
+        drain(product)
         origin.healthy = False
         wait_for(lambda: client.request(product, "/small-health-probe", headers={"Authorization": "Bearer probe"}, status=None)["status"] == 502,
                  "all origins unhealthy", 10)
@@ -232,25 +374,19 @@ def public_functional(args, fixtures, output, smoke=False):
         origin.healthy = True
         wait_for(lambda: client.request(product, "/small-health-probe", headers={"Authorization": "Bearer probe"}, status=None)["status"] == 200,
                  "origin recovered", 10)
-        # Restart with a different block layout, then revert without deleting the old files.
-        product.stop()
-        original = product.config["cache.range_block_bytes"]
-        product.config["cache.range_block_bytes"] = ("INT", 64 << 10 if block != 64 << 10 else MIB)
-        product.write_config()
-        product.start()
-        product.stats_offset = 0
-        before = origin.snapshot(path)
-        client.checked(product, path, headers={"Range": "bytes=0-16"}, status=206, expected=client.expected(path, bounds=(0, 16)))
-        assert origin.snapshot(path)["bytes"] > before["bytes"]
-        product.stop()
-        product.config["cache.range_block_bytes"] = original
-        product.write_config()
-        product.start()
-        product.stats_offset = 0
-        before = origin.snapshot(path)
-        client.checked(product, path, headers={"Range": "bytes=0-16"}, status=206, expected=client.expected(path, bounds=(0, 16)))
-        assert origin.snapshot(path) == before
-        record(output, evidence, "layout restart isolation and revert reuse", drain=drain(product))
+        # Reopening the same fixed geometry must retain the committed chunk.
+        for bounds in ((0, 16), (block - 17, block - 1)):
+            product.stop()
+            product.start()
+            product.stats_offset = 0
+            before = origin.snapshot(path)
+            response = client.checked(product, path, headers={"Range": f"bytes={bounds[0]}-{bounds[1]}"},
+                                      status=206, expected=client.expected(path, bounds=bounds))
+            headers = {name.lower(): value for name, value in response["headers"].items()}
+            assert headers["content-length"] == "17", response
+            assert headers["content-range"] == f"bytes {bounds[0]}-{bounds[1]}/{large}", response
+            assert origin.snapshot(path) == before
+        record(output, evidence, "fixed 1 MiB chunk survives repeated clean restart", drain=drain(product))
     return evidence
 
 
@@ -364,6 +500,17 @@ def public_benchmark(args, fixtures, output):
         product = Product("razor", output / "public-benchmark", origin, args)
         cleanup.callback(product.stop)
         for repeat in range(args.repeats):
+            for length in (1, 4096):
+                path = f"/large-range-{length}-r{repeat + 1}"
+                bounds = (123, 123 + length - 1)
+                headers = {"Range": f"bytes={bounds[0]}-{bounds[1]}"}
+                cold = client.batch(product, origin, f"range-{length}-cold-r{repeat + 1}", path, 1,
+                                    count=1, bounds=bounds, headers=headers)
+                assert cold["origin"] == {"requests": 2, "get": 1, "head": 1, "bytes": MIB}, cold
+                assert cold["response_body_bytes"] == length, cold
+                hot = client.batch(product, origin, f"range-{length}-hot-r{repeat + 1}", path, 1,
+                                   count=1, duration=args.seconds, bounds=bounds, headers=headers)
+                assert hot["origin"]["requests"] == 0 and hot["origin"]["bytes"] == 0, hot
             for size, steps in (("small", (1, 8, 32, 100)), ("large", (1, 8, 32))):
                 hot = f"/{size}-hot-public"
                 client.checked(product, hot)
