@@ -425,7 +425,11 @@ func (s *Server) fetchRangeRun(task *fillTask, request *http.Request, root []byt
 		s.invalidateRange(request, root, parent, m)
 		return errRangeBypass
 	}
+	defer s.fills.endPartialChunk(task)
 	for index := first; index <= last; index++ {
+		if err := s.fills.beginPartialChunk(task); err != nil {
+			return err
+		}
 		chunkStart := index * m.ChunkBytes
 		size := min(m.ChunkBytes, m.Total-chunkStart)
 		chunkInfo := *info
@@ -490,6 +494,7 @@ func (s *Server) fetchRangeRun(task *fillTask, request *http.Request, root []byt
 			return err
 		}
 		close(chunk.done)
+		s.fills.endPartialChunk(task)
 		if readErr != nil && index != last {
 			return io.ErrUnexpectedEOF
 		}

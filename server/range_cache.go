@@ -596,19 +596,8 @@ func (s *Server) servePartialObject(w http.ResponseWriter, r *http.Request, root
 		if _, err = io.CopyN(io.Discard, sub.body, low); err != nil {
 			panic(http.ErrAbortHandler)
 		}
-		// Hold the last byte until validation so normal client completion cannot cancel the aligned fill.
-		limited := &io.LimitedReader{R: sub.body, N: high - low - 1}
+		limited := &io.LimitedReader{R: sub.body, N: high - low}
 		if err = s.streamResponse(w, limited, r); err != nil || limited.N != 0 {
-			panic(http.ErrAbortHandler)
-		}
-		var last [1]byte
-		if _, err = io.ReadFull(sub.body, last[:]); err != nil {
-			panic(http.ErrAbortHandler)
-		}
-		if err = sub.wait(); err != nil {
-			panic(http.ErrAbortHandler)
-		}
-		if err = s.streamResponse(w, bytes.NewReader(last[:]), r); err != nil {
 			panic(http.ErrAbortHandler)
 		}
 		sub.close()

@@ -119,8 +119,8 @@ func TestPartialChunkTerminalReadResult(t *testing.T) {
 					}
 					status, body, err := request(value)
 					if failed {
-						if err == nil && status < 500 {
-							t.Fatalf("source error accepted: status=%d bytes=%d", status, len(body))
+						if err == nil && status < 500 && (status != wantStatus || !bytes.Equal(body, tr.data)) {
+							t.Fatalf("incomplete response accepted: status=%d bytes=%d", status, len(body))
 						}
 					} else if err != nil || status != wantStatus || !bytes.Equal(body, tr.data) {
 						t.Fatalf("valid (n, EOF) rejected: status=%d bytes=%d err=%v", status, len(body), err)

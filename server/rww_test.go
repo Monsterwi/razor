@@ -406,6 +406,7 @@ func TestBlockLayoutRestartAndReloadIsolation(t *testing.T) {
 		cfg.RangeBlockBytes = tc.size
 		s := blockServer(t, cfg, path, 64<<20, origin.URL)
 		got := fetch(s, "http://cache.test/item", http.Header{"Range": {"bytes=7-19"}})
+		waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillTasks == 0 && st.CacheWriters == 0 })
 		if got.Code != 206 || !bytes.Equal(got.Body.Bytes(), data[7:20]) || bodyBytes.Load() != tc.total {
 			t.Fatalf("size=%d status=%d bytes=%d origin=%d", tc.size, got.Code, got.Body.Len(), bodyBytes.Load())
 		}
@@ -695,6 +696,7 @@ func TestUnknownHeadersDoNotCreateConcurrentBlockProducers(t *testing.T) {
 	if got := <-first; got.Code != 206 || !bytes.Equal(got.Body.Bytes(), data[:101]) {
 		t.Fatalf("owner status=%d bytes=%d", got.Code, got.Body.Len())
 	}
+	waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillTasks == 0 && st.CacheWriters == 0 })
 	if got := fetch(s, "http://cache.test/item", headers("b", "bytes=1048576-1048676")); got.Code != 206 || !bytes.Equal(got.Body.Bytes(), data[:101]) || blockGets.Load() != 1 {
 		t.Fatalf("committed owner block unusable: status=%d GET=%d", got.Code, blockGets.Load())
 	}

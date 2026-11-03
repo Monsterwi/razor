@@ -456,6 +456,7 @@ func TestRangeCorruptDiskBlockIsMissAfterRestart(t *testing.T) {
 	if got.Code != 206 {
 		t.Fatal(got.Code)
 	}
+	waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillTasks == 0 && st.CacheWriters == 0 })
 	if err := s.Shutdown(); err != nil {
 		t.Fatal(err)
 	}

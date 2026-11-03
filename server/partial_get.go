@@ -129,6 +129,10 @@ func (s *Server) fillGETChunk(task *fillTask, request *http.Request, root []byte
 	chunkInfo.ResponseHeaders = info.ResponseHeaders.Clone()
 	chunkInfo.ResponseHeaders.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+size-1, m.Total))
 	chunkInfo.ResponseHeaders.Set("Content-Length", strconv.FormatInt(size, 10))
+	if err := s.fills.beginPartialChunk(task); err != nil {
+		return err
+	}
+	defer s.fills.endPartialChunk(task)
 	fill, err := s.reservePartialChunk(task, rangeBlockKey(root, m, index), task.token, size, resources)
 	if err != nil {
 		return err

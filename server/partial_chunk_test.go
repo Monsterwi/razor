@@ -91,7 +91,7 @@ func TestRangeStreamsWithinIncompleteChunkAndReusesCompletedChunk(t *testing.T) 
 	}
 }
 
-func TestSmallRangeCompletesOnlyAfterAlignedChunkIsValidated(t *testing.T) {
+func TestSmallRangeCompletesBeforeAlignedChunkIsValidated(t *testing.T) {
 	data := bytes.Repeat([]byte("s"), 1<<20)
 	release := make(chan struct{})
 	unblock := sync.OnceFunc(func() { close(release) })
@@ -140,13 +140,14 @@ func TestSmallRangeCompletesOnlyAfterAlignedChunkIsValidated(t *testing.T) {
 	}()
 	select {
 	case err := <-last:
-		t.Fatalf("response completed before aligned chunk validated: %v", err)
-	case <-time.After(30 * time.Millisecond):
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("response waited for the aligned tail")
 	}
 	unblock()
-	if err = <-last; err != nil {
-		t.Fatal(err)
-	}
+	waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillTasks == 0 && st.CacheWriters == 0 })
 	resp.Body.Close()
 	req, _ = http.NewRequest("GET", front.URL+"/small-range", nil)
 	req.Header.Set("Range", "bytes=70000-70015")
