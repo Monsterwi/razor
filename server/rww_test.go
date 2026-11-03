@@ -378,6 +378,8 @@ func TestRangeOnlyFetchesMissingAlignedUnion(t *testing.T) {
 		if got.Code != 206 || int64(got.Body.Len()) != tc.want || !bytes.Equal(got.Body.Bytes(), bytes.Repeat([]byte("q"), int(tc.want))) {
 			t.Fatalf("union response=%d bytes=%d", got.Code, got.Body.Len())
 		}
+		// The next request measures committed hits, after the detached tail publishes.
+		waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillTasks == 0 && st.CacheWriters == 0 })
 		if originBytes.Load() != tc.origin {
 			t.Fatalf("union origin=%d want=%d", originBytes.Load(), tc.origin)
 		}

@@ -608,6 +608,8 @@ func TestPartialGETCountsOneCacheOutcomePerResponse(t *testing.T) {
 				if got.Code != 200 || !bytes.Equal(got.Body.Bytes(), data) {
 					t.Fatal("incorrect GET")
 				}
+				// Response completion may precede publication of the final chunk.
+				waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillTasks == 0 && st.CacheWriters == 0 })
 			}
 			st := s.Stats()
 			if st.Requests != 2 || st.Hits != 1 || st.Misses != 1 {
