@@ -445,6 +445,9 @@ class Client:
             ({**(headers or {}), "Range": "bytes=%d-%d" % limits}, self.expected(path, bounds=limits))
             for limits in ranges]
         path_expected = {p: self.expected(p) for p in paths or ()}
+        if product.kind == "razor":
+            from public_acceptance import drain
+            drain(product)  # Exclude the preceding group or warm-up's unfinished tail.
         before = origin.snapshot()
         structured_before = None
         if product.kind == "razor":
@@ -495,10 +498,14 @@ class Client:
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
                 rows = [r for group in pool.map(worker, range(concurrency)) for r in group]
+            elapsed = time.monotonic() - start
+            client_cpu = time.process_time() - harness_cpu
+            if product.kind == "razor":
+                drain(product)  # Client EOF can precede current-chunk validation.
+            observation = time.monotonic() - start
         finally:
             done.set()
             monitor.join()
-        elapsed = time.monotonic() - start
         samples.append(product.resource())
         after = origin.snapshot()
         payload = sum(r["bytes"] for r in rows if r["status"] in (200, 206) and not r["error"])
@@ -512,11 +519,12 @@ class Client:
             return {"p" + str(q): values[max(0, math.ceil(len(values) * q / 100) - 1)] for q in (50, 95, 99)}
         summary = {"name": name, "product": product.kind, "concurrency": concurrency, "requests": len(rows),
                    "response_body_bytes": payload,
-                   "seconds": elapsed, "requests_per_second": len(rows) / elapsed,
+                   "seconds": elapsed, "fill_settle_seconds": observation - elapsed,
+                   "observation_seconds": observation, "requests_per_second": len(rows) / elapsed,
                    "mib_per_second": payload / MIB / elapsed, "ttfb_ms": quantiles("ttfb_ms"),
                    "completion_ms": quantiles("completion_ms"), "unexpected_errors": len(errors),
                    "object_requests": {size: sum(size in r["path"] for r in rows) for size in ("small", "large")},
-                   "harness_cpu_cores": (time.process_time() - harness_cpu) / elapsed,
+                   "harness_cpu_cores": client_cpu / elapsed,
                    "process_io_bytes": {k: samples[-1][k] - initial[k] for k in ("read_bytes", "write_bytes")},
                    "statuses": {str(s): sum(r["status"] == s for r in rows) for s in set(r["status"] for r in rows)},
                    "origin": {k: after[k] - before[k] for k in after},
@@ -550,6 +558,7 @@ class Client:
 
 
 def functional(args, fixtures, output):
+    from public_acceptance import drain
     with ExitStack() as cleanup:
         origin = Origin(fixtures, output / "origin-functional.json")
         cleanup.callback(origin.close)
@@ -596,6 +605,7 @@ def functional(args, fixtures, output):
         path = "/large-ranges"
         for bounds in [(0, 1572863), (1048576, 2097151)]:
             client.checked(product, path, headers={"Range": "bytes=%d-%d" % bounds}, expected=client.expected(path, bounds=bounds), status=206)
+        drain(product)
         assert origin.snapshot(path)["bytes"] == 2 * MIB
         record("overlap 2.5MiB responses fetch only2MiB", origin=origin.snapshot(path))
         client.checked(product, path, headers={"Range": "bytes=0-"}, status=206)
@@ -625,6 +635,7 @@ def functional(args, fixtures, output):
         assert result["error"], result
         client.checked(product, changed, headers={"Range": f"bytes=0-{bounds[1]}"}, expected=client.expected(changed, version=2, bounds=bounds), status=206)
         record("Range version changes mid-fill: controlled failure then exact new version")
+        drain(product)
         before = origin.snapshot()
         product.stop()
         product.start()
@@ -637,6 +648,7 @@ def functional(args, fixtures, output):
         before = origin.snapshot()
         client.checked(product, "/large-full")
         client.checked(product, "/large-ranges", headers={"Range": "bytes=0-16"}, expected=client.expected("/large-ranges", bounds=(0, 16)), status=206)
+        drain(product)
         assert origin.snapshot()["bytes"] - before["bytes"] == large_bytes + MIB
         record("authenticated exact PURGE fences full object and range family")
         # Creator closes its TCP request before headers; follower still gets the full object.
@@ -719,6 +731,7 @@ def functional(args, fixtures, output):
                         "http.health.successes": ("INT", 1)})
         client.checked(product, "/small-health-full")
         client.checked(product, "/small-health-range", headers={"Range": "bytes=0-16"}, expected=client.expected("/small-health-range", bounds=(0, 16)), status=206)
+        drain(product)
         origin.healthy = False
         probe_headers = {"Authorization": "Bearer health-probe-only"}
         wait_for(lambda: client.request(product, "/small-health-probe", headers=probe_headers, status=None)["status"] == 502,
