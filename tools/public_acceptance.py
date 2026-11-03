@@ -11,7 +11,7 @@ import socket
 import threading
 import time
 
-from acceptance import CHUNK, MIB, Client, Origin, Product, save, wait_for
+from acceptance import CHUNK, MIB, Client, Origin, Product, read_complete_log, save, wait_for
 
 DRAIN_FIELDS = ("InFlight", "Queued", "CacheWriters", "CacheQueued", "RangeReaders", "RangeReaderQueued",
                 "DiskQueued", "DiskBufferedBytes", "BufferReserved", "SharedFillTasks", "SharedFillWaiters", "RetiredRuntimes")
@@ -25,15 +25,13 @@ def snapshot(product):
     found = []
     def ready():
         nonlocal offset
-        with (product.dir / "process.log").open() as stream:
-            stream.seek(offset)
-            for line in stream:
-                marker = "HTTP resource stats JSON: "
-                if marker in line:
-                    sample = json.loads(line.split(marker, 1)[1])
-                    if sample["SnapshotUnixNano"] >= requested:
-                        found.append(sample)
-            offset = stream.tell()
+        logs, offset = read_complete_log(product.dir / "process.log", offset)
+        for line in logs.splitlines():
+            marker = "HTTP resource stats JSON: "
+            if marker in line:
+                sample = json.loads(line.split(marker, 1)[1])
+                if sample["SnapshotUnixNano"] >= requested:
+                    found.append(sample)
         return bool(found)
     wait_for(ready, "structured resource snapshot")
     product.stats_offset = offset

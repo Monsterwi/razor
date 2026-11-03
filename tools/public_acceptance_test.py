@@ -3,12 +3,61 @@ from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 import http.client
+import json
 import os
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from acceptance import Client, Origin, create_fixtures, MIB
+
+
+class StatsSnapshotTest(unittest.TestCase):
+    def test_snapshot_waits_for_split_marker_and_json_without_losing_bytes(self):
+        from public_acceptance import snapshot
+        line = '日志 HTTP resource stats JSON: {"SnapshotUnixNano":200,"InFlight":0}\n'.encode()
+        for split in (len('日志 HTTP res'.encode()), len(line) - 5):
+            with self.subTest(split=split), tempfile.TemporaryDirectory() as directory:
+                log = Path(directory) / "process.log"
+                product = SimpleNamespace(dir=Path(directory), resource=lambda: {},
+                    proc=SimpleNamespace(send_signal=lambda _: log.write_bytes(line[:split])))
+                def wait(check, description):
+                    self.assertFalse(check(), "an unfinished log record became a snapshot")
+                    with log.open("ab") as stream:
+                        stream.write(line[split:])
+                    self.assertTrue(check(), "the split record was discarded")
+                with patch("public_acceptance.wait_for", wait), patch("public_acceptance.time.time_ns", return_value=100):
+                    result = snapshot(product)
+                self.assertEqual(result["stats"], {"SnapshotUnixNano": 200, "InFlight": 0})
+                self.assertEqual(product.stats_offset, len(line))
+
+    def test_snapshot_leaves_trailing_partial_marker_for_next_call(self):
+        from public_acceptance import snapshot
+        first = b'HTTP resource stats JSON: {"SnapshotUnixNano":200,"InFlight":1}\n'
+        second = b'HTTP resource stats JSON: {"SnapshotUnixNano":300,"InFlight":0}\n'
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "process.log"
+            log.touch()
+            pieces = iter((first + second[:10], second[10:]))
+            def emit(_):
+                with log.open("ab") as stream:
+                    stream.write(next(pieces))
+            product = SimpleNamespace(dir=Path(directory), resource=lambda: {}, proc=SimpleNamespace(send_signal=emit))
+            with patch("public_acceptance.time.time_ns", side_effect=(100, 250)):
+                self.assertEqual(snapshot(product)["stats"]["InFlight"], 1)
+                self.assertEqual(product.stats_offset, len(first))
+                self.assertEqual(snapshot(product)["stats"]["InFlight"], 0)
+                self.assertEqual(product.stats_offset, len(first + second))
+
+    def test_snapshot_rejects_complete_malformed_json(self):
+        from public_acceptance import snapshot
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "process.log"
+            product = SimpleNamespace(dir=Path(directory), resource=lambda: {}, proc=SimpleNamespace(
+                send_signal=lambda _: log.write_text('HTTP resource stats JSON: {broken}\n')))
+            with self.assertRaises(json.JSONDecodeError):
+                snapshot(product)
 
 
 class PublicToolsTest(unittest.TestCase):

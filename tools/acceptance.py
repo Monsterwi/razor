@@ -43,6 +43,15 @@ def wait_for(check, description, timeout=15):
     raise AssertionError("timeout: " + description)
 
 
+def read_complete_log(path, offset=0):
+    """Keep a live writer's unfinished record for the next read."""
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        data = stream.read()
+    end = data.rfind(b"\n") + 1
+    return data[:end].decode(), offset + end
+
+
 def free_port():
     # Origin/health outbound allocation must not take this released listener port.
     low, high = map(int, Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split())
@@ -454,13 +463,12 @@ class Client:
             from public_acceptance import snapshot
             structured_before = snapshot(product)
         initial = product.resource()
-        logs_before = (product.dir / "process.log").stat().st_size
+        logs_before = product.stats_offset if product.kind == "razor" else (product.dir / "process.log").stat().st_size
         if product.kind == "razor":
             product.proc.send_signal(signal.SIGUSR1)
             def has_snapshot():
-                with (product.dir / "process.log").open() as f:
-                    f.seek(logs_before)
-                    return "Goroutines:" in f.read()
+                logs, _ = read_complete_log(product.dir / "process.log", logs_before)
+                return "Goroutines:" in logs
             wait_for(has_snapshot, "resource snapshot")
         samples, done = [initial], threading.Event()
         def sample():
@@ -510,9 +518,7 @@ class Client:
         after = origin.snapshot()
         payload = sum(r["bytes"] for r in rows if r["status"] in (200, 206) and not r["error"])
         errors = [r for r in rows if r["error"] and r["status"] not in allowed]
-        with (product.dir / "process.log").open() as f:
-            f.seek(logs_before)
-            logs = f.read()
+        logs, _ = read_complete_log(product.dir / "process.log", logs_before)
         goroutines = [int(n) for n in re.findall(r"Goroutines:(\d+)", logs)]
         def quantiles(key):
             values = sorted(r[key] for r in rows if r[key] is not None)

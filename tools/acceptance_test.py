@@ -1,4 +1,6 @@
 import os
+import json
+import time
 from contextlib import ExitStack
 from pathlib import Path
 import sys
@@ -196,3 +198,61 @@ class WorkloadTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BatchStatsLogTest(unittest.TestCase):
+    def test_batch_preserves_record_boundaries_and_rejects_bad_json(self):
+        from public_acceptance import DRAIN_FIELDS
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            root = Path(directory)
+            fixtures = acceptance.create_fixtures(root / "fixtures", acceptance.MIB)
+            origin = acceptance.Origin(fixtures, root / "origin.json")
+            cleanup.callback(origin.close)
+            client = acceptance.Client(fixtures, root)
+            cleanup.callback(client.raw.close)
+            log = root / "process.log"
+            log.touch()
+            stats = dict.fromkeys((*DRAIN_FIELDS, "Requests", "Hits", "Misses", "Bypass", "Bytes",
+                "RangeBlockHits", "RangeBlockMisses", "RangeHitBytes", "RangeMissBytes", "SharedFillJoined",
+                "SharedFillCompleted", "SharedFillFailed", "Cancelled", "GCCount", "GCPauseTotalNanoseconds", "TotalAlloc"), 0)
+            stats["Origin"] = {"InFlight": 0}
+            def record(label):
+                return "HTTP resource stats JSON: " + json.dumps({**stats, "SnapshotUnixNano": time.time_ns(), "Sample": label}) + "\n"
+            pending, signals = [], 0
+            def emit(_):
+                nonlocal signals
+                signals += 1
+                with log.open("a") as stream:
+                    stream.write("".join(pending))
+                    pending.clear()
+                    stream.write(record("complete") + "Goroutines:1\n")
+                    if signals == 2:
+                        line = record("boundary")
+                        stream.write(line[:10])
+                        pending.append(line[10:])
+            product = SimpleNamespace(kind="razor", port=origin.server.server_port, dir=root,
+                proc=SimpleNamespace(send_signal=emit), resource=lambda: {
+                    "cpu_seconds": 0, "rss_bytes": 0, "fds": 0, "read_bytes": 0, "write_bytes": 0})
+            sample_origin, origin_samples = origin.snapshot, 0
+            def sample_and_write_tail():
+                nonlocal origin_samples
+                result = sample_origin()
+                origin_samples += 1
+                if origin_samples == 2:
+                    line = record("tail")
+                    with log.open("a") as stream:
+                        stream.write(line[:-5])
+                    pending.append(line[-5:])
+                elif origin_samples == 4:
+                    with log.open("a") as stream:
+                        stream.write('HTTP resource stats JSON: {broken}\n')
+                return result
+            with patch.object(origin, "snapshot", side_effect=sample_and_write_tail):
+                result = client.batch(product, origin, "partial-stats", "/small-log", 1, count=1)
+                with self.assertRaises(json.JSONDecodeError):
+                    client.batch(product, origin, "malformed-stats", "/small-log", 1, count=1)
+            self.assertEqual(result["requests"], 1)
+            self.assertEqual(result["unexpected_errors"], 0)
+            labels = [sample["Sample"] for sample in result["server_stats_samples"]]
+            self.assertIn("boundary", labels, "batch start discarded a partial marker")
+            self.assertNotIn("tail", labels, "batch included an unfinished record")
