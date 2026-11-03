@@ -307,6 +307,8 @@ func TestColdGETCancellationKeepsFutureRangeAndCommittedChunks(t *testing.T) {
 	data := bytes.Repeat([]byte("c"), (3<<20)+17)
 	advance := make(chan struct{})
 	release := sync.OnceFunc(func() { close(advance) })
+	finishCurrent := make(chan struct{})
+	finish := sync.OnceFunc(func() { close(finishCurrent) })
 	cancelled := make(chan struct{}, 1)
 	var gets, heads atomic.Int32
 	s, _ := cacheServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -327,7 +329,15 @@ func TestColdGETCancellationKeepsFutureRangeAndCommittedChunks(t *testing.T) {
 		w.(http.Flusher).Flush()
 		select {
 		case <-advance:
-			_, _ = w.Write(data[6<<10 : (2<<20)+(6<<10)])
+			_, _ = w.Write(data[6<<10 : (1<<20)+(64<<10)])
+			w.(http.Flusher).Flush()
+		case <-r.Context().Done():
+			cancelled <- struct{}{}
+			return
+		}
+		select {
+		case <-finishCurrent:
+			_, _ = w.Write(data[(1<<20)+(64<<10) : 2<<20])
 			w.(http.Flusher).Flush()
 		case <-r.Context().Done():
 			cancelled <- struct{}{}
@@ -339,6 +349,7 @@ func TestColdGETCancellationKeepsFutureRangeAndCommittedChunks(t *testing.T) {
 	front := httptest.NewServer(s)
 	t.Cleanup(front.Close)
 	t.Cleanup(release)
+	t.Cleanup(finish)
 	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DisableCompression: true}}
 	leader, err := client.Get(front.URL + "/cancel")
 	if err != nil {
@@ -375,6 +386,8 @@ func TestColdGETCancellationKeepsFutureRangeAndCommittedChunks(t *testing.T) {
 	if result.err != nil || result.status != 206 || !bytes.Equal(result.body, data[1048593:1081344]) {
 		t.Fatalf("future Range after leader cancel: status=%d bytes=%d err=%v", result.status, len(result.body), result.err)
 	}
+	waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillWaiters == 0 })
+	finish()
 	select {
 	case <-cancelled:
 	case <-time.After(3 * time.Second):

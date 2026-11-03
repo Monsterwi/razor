@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/Monsterwi/razor/server"
 	"io"
 	"math"
 	"net/http"
@@ -329,10 +330,12 @@ func TestRangeSmallAndEmptyObjectsDoNotCreateNonexistentChunks(t *testing.T) {
 	}
 }
 
-func TestCancelledRangeRunKeepsCommittedPrefix(t *testing.T) {
+func TestCancelledRangeRunFinishesCurrentChunkAndKeepsPrefix(t *testing.T) {
 	const chunk = 1 << 20
 	data := partialRangeData(2 * chunk)
-	cancelled := make(chan struct{})
+	finished := make(chan struct{})
+	release := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
 	var gets atomic.Int32
 	s, _ := cacheServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "public,max-age=3600")
@@ -346,11 +349,16 @@ func TestCancelledRangeRunKeepsCommittedPrefix(t *testing.T) {
 		w.WriteHeader(206)
 		_, _ = w.Write(data[:chunk+(32<<10)])
 		w.(http.Flusher).Flush()
-		<-r.Context().Done()
-		close(cancelled)
+		select {
+		case <-release:
+			_, _ = w.Write(data[chunk+(32<<10):])
+		case <-r.Context().Done():
+		}
+		close(finished)
 	})
 	front := httptest.NewServer(s)
 	t.Cleanup(front.Close)
+	t.Cleanup(unblock)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, front.URL+"/cancelled-run", nil)
@@ -360,21 +368,24 @@ func TestCancelledRangeRunKeepsCommittedPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	prefix := make([]byte, chunk)
-	if _, err := io.ReadFull(resp.Body, prefix); err != nil || !bytes.Equal(prefix, data[:chunk]) {
+	prefix := make([]byte, chunk+4096)
+	if _, err := io.ReadFull(resp.Body, prefix); err != nil || !bytes.Equal(prefix, data[:len(prefix)]) {
 		t.Fatalf("complete prefix: %v", err)
 	}
 	cancel()
 	resp.Body.Close()
+	waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillWaiters == 0 && st.SharedFillTasks == 1 })
+	unblock()
 	select {
-	case <-cancelled:
+	case <-finished:
 	case <-time.After(time.Second):
-		t.Fatal("unused run did not cancel")
+		t.Fatal("current chunk did not finish after the last reader left")
 	}
-	resp = rangeHTTP(t, front.Client(), front.URL+"/cancelled-run", 0, chunk-1)
+	waitFillStats(t, s, func(st server.Stats) bool { return st.SharedFillTasks == 0 && st.CacheWriters == 0 })
+	resp = rangeHTTP(t, front.Client(), front.URL+"/cancelled-run", 0, len(data)-1)
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if err != nil || !bytes.Equal(body, data[:chunk]) || gets.Load() != 1 {
+	if err != nil || !bytes.Equal(body, data) || gets.Load() != 1 {
 		t.Fatalf("cancel discarded committed prefix: bytes=%d gets=%d err=%v", len(body), gets.Load(), err)
 	}
 }
