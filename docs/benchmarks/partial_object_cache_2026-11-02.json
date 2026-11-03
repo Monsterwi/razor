@@ -8154,5 +8154,12 @@
     "HDD_CACHE_ROOT": "isolated test cache root on verified HDD",
     "SSD_CACHE_ROOT": "isolated test cache root on verified SSD",
     "LOCAL_RUN_ROOT": "local development correctness artifact root"
+  },
+  "historical_notice": {
+    "source": "a37f325504d661469bbb4b68af736f8a79d1ec3a",
+    "status": "Historical 2026-11-02 results; not evidence for the 2026-11-03 streaming and independent-current-chunk contract.",
+    "replacement_pending": true,
+    "prepared_candidate": "6260620573d0fe601e51d83249a03878dd120ed8",
+    "planned_new_archive": "plan-a46-final-20261103T023131Z"
   }
 }
