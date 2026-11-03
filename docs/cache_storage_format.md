@@ -4,7 +4,7 @@
 
 ## 发布状态
 
-下图描述缓存块的运行时发布状态，不是代码中的枚举。验证源站响应头后，已接收的字节即可供 RWW 读者使用；客户端可先完成自身响应，已经开始的当前块继续独立填充。块完整且校验通过后，先发布数据目录，再发布 segment 完成位；后续失败不会追溯改变已完成响应，但失败块不发布。对象信息与 segment 位图也使用现有缓存记录，不引入独立 manifest 文件。
+运行时提交顺序为：完整校验 → 数据目录 → segment 完成位。RWW 的临时可读字节不等于普通缓存命中；响应完成与块提交的关系见 [RWW](rww_implementation.md)，三类内部记录见 [Partial Object Cache](partial_object_cache.md)。
 
 ![UML 缓存发布状态图](diagrams/publication.svg)
 
@@ -42,9 +42,9 @@
 
 ## 部分对象恢复
 
-各 stripe 独立保存，未增加跨 stripe 事务。对象信息或 segment 成功恢复，不保证另一 stripe 上的 chunk 也已可靠保存：完成位只是规划提示，读取仍校验实际目录、记录身份、长度和 CRC。数据保存失败时，缺块成为 MISS，经条件修复和补块后才能重新使用；不能仅凭恢复的位图返回内容。
+各 stripe 独立保存，无跨 stripe 事务。恢复的对象元数据或位图只是规划依据；chunk 仍须通过目录、身份、长度和 CRC 校验，丢失时按 MISS 条件修复并补块，不能凭位图返回内容。
 
-正常关闭后，稀疏 Range 的已完成块和普通 GET 的分块数据均可复用。异常退出由持久化 session 隔离旧检查点，无法证明一致的 stripe 可以整体冷启动。PURGE 后仍在发送的私有旧流不进入目录或位图；即使它晚于新代次结束，也不能通过检查点重新发布。
+正常关闭后可复用 GET/Range 已完成块；异常退出由 session 隔离旧检查点，无法证明一致的 stripe 可整体冷启动。PURGE 私有旧流不进入目录或位图，不能经检查点复活。
 
 | 验收 | 可观察结果 |
 | --- | --- |
@@ -53,13 +53,5 @@
 | checkpoint Rename 失败 | Close 返回错误，其他 stripe 仍完成关闭；临时文件清理，失败 stripe 重开不伪造命中 |
 | 格式与文件作用域 | 不兼容对象版本、块布局、segment 版本及旧 namespace 被拒绝；业务文件、无关 sidecar、独立缓存的原始字节保持不变 |
 | 真实进程重启 | 验证状态、响应头、正文 SHA 和源站正文计数；正常重启复用稀疏块，缺块单独回源；强杀或 PURGE 后重建不复活旧代次 |
-
-复现入口：
-
-```sh
-go test -race ./cache -run 'TestPartialRecovery|TestPartialCheckpoint' -count=1
-go build -o /tmp/razor-recovery .
-RAZOR_ACCEPTANCE_BINARY=/tmp/razor-recovery python3 -m unittest discover -s tools -p 'partial_recovery_test.py' -v
-```
 
 验证代码：[部分对象恢复](../cache/partial_recovery_test.go)、[进程 HTTP 恢复](../tools/partial_recovery_test.py)、[提交/回卷](../cache/storage_commit_test.go)、[恢复/损坏/子进程强杀](../cache/recovery_test.go)、[PURGE 后强杀](../cache/invalidation_restart_test.go)。数据及位图短写、EIO、ENOSPC 和数据 Sync、checkpoint Rename 失败已有确定性验证；未分别注入临时检查点文件 Sync、父目录 Sync 或物理断电，不将进程强杀等同于这些故障。
