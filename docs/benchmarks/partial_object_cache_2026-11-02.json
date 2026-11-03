@@ -9979,7 +9979,113 @@
     "ready_for_review": false,
     "full_branch_review": "Parent delivery workflow reports final standards/spec reviews separately.",
     "ci_status": "The recorded late-old-failure fixture race is corrected and the original full-project coverage command passes locally; parent workflow confirms final remote CI separately.",
-    "pending_tool_followup": "Parent workflow is correcting access-log readers handling a partially written JSON line. No production or measurement-definition change; the recorded 34-tool pass belongs to the stated earlier suite. New suite count and final CI are reported separately."
+    "pending_tool_followup": null,
+    "resource_stats_log_followup": {
+      "tool_source_sha": "b521691d1fe73f2c264e6414ee48976aa95980ca",
+      "scope": "Complete newline-terminated resource stats records at snapshot and batch entrypoints; retain partial-tail byte offsets; complete malformed JSON still raises.",
+      "production_code_changed": false,
+      "measurement_definitions_changed": false,
+      "server_binary_sha256": "3f4b34f4aed103199c3b827ab73c25c49c13a40768fc0852799821fe1b1c8481",
+      "new_test_methods": [
+        "StatsSnapshotTest.test_snapshot_waits_for_split_marker_and_json_without_losing_bytes",
+        "StatsSnapshotTest.test_snapshot_leaves_trailing_partial_marker_for_next_call",
+        "StatsSnapshotTest.test_snapshot_rejects_complete_malformed_json",
+        "BatchStatsLogTest.test_batch_preserves_record_boundaries_and_rejects_bad_json"
+      ],
+      "full_suite": {
+        "tests": 38,
+        "skipped": 0,
+        "unittest_seconds": 35.585,
+        "log": "stats-log-full-tools.log",
+        "command": [
+          "python3",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "tools",
+          "-p",
+          "*test.py",
+          "-v"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 35.7245402999979
+      },
+      "deterministic_repeat": {
+        "repetitions": 20,
+        "original_split_write_reproduction_passes": 20,
+        "four_test_suite_passes": 20,
+        "exit_codes": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "log": "stats-log-repeat.log",
+        "exit_record": "stats-log-repeat.exit.json"
+      },
+      "short_soak_repeat": {
+        "log": "stats-log-short-soak-repeat.log",
+        "command": [
+          "python3",
+          "-m",
+          "unittest",
+          "public_acceptance_test.PublicToolsTest.test_real_binary_short_soak_has_all_phases_and_hard_drain",
+          "-v"
+        ],
+        "repetitions": 5,
+        "exit_codes": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "elapsed_seconds": 13.825629488012055
+      },
+      "red_evidence": [
+        "partial-snapshot-red.log",
+        "stats-log-snapshot-red.log",
+        "stats-log-batch-red.log"
+      ],
+      "final_ci_and_review": "See PR #47 latest checks and parent delivery summary; not predeclared green here."
+    }
   },
   "path_redaction": {
     "note": "Public command/config paths use descriptive variables. Original raw evidence is unchanged.",

@@ -128,6 +128,7 @@ benchmark overlap 组是 0/4/8/12 MiB 起点、各 16 MiB、8 个客户端，联
 | 工具与真实进程 | 34 tools、0 skip；保守20、Otter18、S3-FIFO18 全通过 | `stream-fill-final-tools.log`、对应 functional 日志 |
 | 独立集成 race | 13 个 stream-fill/终态入口，各2轮，exit 0 | `merge-stream-fill-race-test.log` |
 | CI 原全仓 coverage 命令 | ef41a50，exit 0；测试同步修正后全仓通过 | `stream-fill-ci-coverage-fixed.log` |
+| 资源统计日志修复 | `b521691`；38 tools、0 skip、exit 0；短 soak 5 轮通过 | `stats-log-full-tools.log`、`stats-log-short-soak-repeat.log` |
 | 专机 | 两介质各18 functional、69 benchmark、metadata read/publish各3轮；13命令exit 0 | 新批次 `command-exits.json` |
 
 `ef41a50` 修复的是缓存已提交断言的测试前提：旧 fixture 在客户端 EOF 后立即把尾块当成已提交缓存，coverage 重复出现 8/50 次失败；诊断的 9/100 次失败均仍有一个 fill task 和 writer。只在保留缓存断言前等待已有公开 Stats 排空，保持在途旧 412、不重试、响应字节和 GET=3/4 断言；三种模式 ×100 coverage、相关 race ×20 及全仓 coverage 随后通过。该四行测试修改未改变生产或测量工具，ef41a50 与 6260620 构建逐字节相同。最终远端 CI 和整分支审查结果仍由主交付记录确认。
@@ -163,4 +164,4 @@ GOMAXPROCS=8 TMPDIR="$META_TMP" "$CACHE_TEST" -test.run '^$' \
 
 本批没有匹配旧基线收益、ATS 对比、WAN/TLS/H2 压力、两小时长测或硬件断电结果。历史附件不能补齐这些空缺。完整分支两轴审查与合并批准由交付流程单独记录，本报告不表示默认分支已合并、部署或发布。
 
-报告生成时，主交付流程正在修复工具读取访问日志遇到尚未写完一行 JSON 的解析问题。该修复不改变生产代码或本批计量口径；本报告的 34 项工具通过明确对应已记录的 6260620 二进制与当时工具版本，后续工具测试数量、最终 CI 与审查状态另行更新。
+资源统计日志读取修复已提交为 `b521691d1fe73f2c264e6414ee48976aa95980ca`：两个解析入口只处理以换行结束的完整记录，保留未完成尾部的字节偏移，完整坏 JSON 仍报错。4 个新增测试使工具套件从原 34 项增为 38 项；完整套件通过（0 skip、35.585 s），原分段写入复现与定向套件各重复 20 次通过，真实进程七阶段短 soak 重复 5 次通过。日志及实际退出结果见 JSON 的 `resource_stats_log_followup`。生产代码、指标定义和 6260620 专机测量数值未变；原 34 项证据继续保留。最终远端 CI 与两轴审查以 [PR #47](https://github.com/Monsterwi/razor/pull/47) 最新 checks 和主交付流程汇总为准。
